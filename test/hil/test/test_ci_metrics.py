@@ -450,7 +450,7 @@ class TestWorkflowSelectionHandOff(unittest.TestCase):
     def _run_extras_block(self, sel):
         """Extract the build-extras shell block from build.yml and run it for real.
         Nothing else exercises it, which is why the empty/rejected conflation shipped."""
-        import re as _re, subprocess, tempfile, json as _json
+        import re as _re, shlex, subprocess, tempfile, json as _json
         repo = os.path.dirname(CIRCLECI)
         i = self.build.index("EXAMPLE_MAP='{}'\n          BUILD_FILTERED='false'")
         i = self.build.rindex('\n', 0, i) + 1
@@ -466,8 +466,10 @@ class TestWorkflowSelectionHandOff(unittest.TestCase):
             self.assertTrue(matrix, 'ci_set_matrix produced nothing')
             sh = os.path.join(d, 'probe.sh')
             with open(sh, 'w') as fh:
-                fh.write('BUILD_SELECT_FILE=' + selp + '\n')
-                fh.write("MATRIX_JSON='" + matrix + "'\n")
+                # shlex.quote, not hand-rolled quoting: a TMPDIR with a space in it
+                # made this fail for a reason that had nothing to do with the block
+                fh.write('BUILD_SELECT_FILE=' + shlex.quote(selp) + '\n')
+                fh.write('MATRIX_JSON=' + shlex.quote(matrix) + '\n')
                 fh.write(block)
                 # sentinel + newline separated: the block itself writes ::warning:: to
                 # stdout, and '|' would collide with the regex's own separator
