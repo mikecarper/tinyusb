@@ -1067,6 +1067,11 @@ void tusb_hal_nrf_power_event (uint32_t event)
         NVIC_EnableIRQ(USBD_IRQn);
       }
 
+      // USB_EVT_DETECTED may have requested HFCLK before the SoftDevice took
+      // ownership of CLOCK. Request it again in the current context so this
+      // post-SoftDevice READY path cannot wait forever.
+      hfclk_enable();
+
       // Wait for HFCLK
       while ( !hfclk_running() ) { }
 
