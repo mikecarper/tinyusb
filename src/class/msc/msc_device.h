@@ -48,6 +48,10 @@
   #error CFG_TUD_MSC_EP_BUFSIZE must be defined, value of a block size should work well, the more the better
 #endif
 
+#ifndef CFG_TUD_MSC_DEFERRED_WRITE_RETRY
+  #define CFG_TUD_MSC_DEFERRED_WRITE_RETRY 0
+#endif
+
 TU_VERIFY_STATIC(CFG_TUD_MSC_EP_BUFSIZE < UINT16_MAX, "Size is not correct");
 
 //--------------------------------------------------------------------+
@@ -56,6 +60,16 @@ TU_VERIFY_STATIC(CFG_TUD_MSC_EP_BUFSIZE < UINT16_MAX, "Size is not correct");
 
 // Set SCSI sense response
 bool tud_msc_set_sense(uint8_t lun, uint8_t sense_key, uint8_t add_sense_code, uint8_t add_sense_qualifier);
+
+// A WRITE10 callback may report BUSY by consuming fewer bytes than TinyUSB
+// supplied. Snapshotting returns an opaque generation for the exact buffered
+// retry. A later retry succeeds only if that same generation is still pending,
+// so a BOT/bus reset followed by a new command cannot consume new work through
+// a stale main-loop snapshot.
+#if CFG_TUD_MSC_DEFERRED_WRITE_RETRY
+bool tud_msc_write10_retry_snapshot(uint32_t* generation);
+bool tud_msc_write10_retry(uint32_t generation);
+#endif
 
 //--------------------------------------------------------------------+
 // Application Callbacks (WEAK is optional)
@@ -122,6 +136,20 @@ void tud_msc_capacity_cb(uint8_t lun, uint32_t* block_count, uint16_t* block_siz
 int32_t tud_msc_scsi_cb (uint8_t lun, uint8_t const scsi_cmd[16], void* buffer, uint16_t bufsize);
 
 /*------------- Optional callbacks -------------*/
+
+// Invoked after a valid CBW is accepted and before any built-in or application
+// SCSI processing begins. Exactly one command is active per MSC BOT interface.
+TU_ATTR_WEAK void tud_msc_command_begin_cb(uint8_t lun, uint8_t const scsi_cmd[16]);
+
+// Invoked after the command's CSW has reached the host, after the existing
+// command-specific completion callback. This covers READ10, WRITE10, built-in,
+// and application-provided SCSI commands uniformly.
+TU_ATTR_WEAK void tud_msc_command_complete_cb(uint8_t lun, uint8_t const scsi_cmd[16]);
+
+// Invoked when BOT reset or USB bus reset abandons any command without a CSW.
+// Applications can clear command-lifecycle state without treating reset as
+// successful media completion.
+TU_ATTR_WEAK void tud_msc_reset_cb(void);
 
 // Invoked when received GET_MAX_LUN request, required for multiple LUNs implementation
 TU_ATTR_WEAK uint8_t tud_msc_get_maxlun_cb(void);

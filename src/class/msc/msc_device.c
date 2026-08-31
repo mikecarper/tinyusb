@@ -65,6 +65,17 @@ typedef struct
   uint32_t total_len;   // byte to be transferred, can be smaller than total_bytes in cbw
   uint32_t xferred_len; // numbered of bytes transferred so far in the Data Stage
 
+#if CFG_TUD_MSC_DEFERRED_WRITE_RETRY
+  // A partial/zero WRITE10 callback leaves the received endpoint buffer owned
+  // by MSC until the application retries it from its main loop. Keeping this
+  // out of the USB event queue prevents a busy callback from monopolizing
+  // tud_task(), without throttling unrelated control or CDC events.
+  uint32_t write10_retry_bytes;
+  uint32_t write10_retry_generation;
+  uint8_t  write10_retry_rhport;
+  bool     write10_retry_pending;
+#endif
+
   // Sense Response Data
   uint8_t sense_key;
   uint8_t add_sense_code;
@@ -73,6 +84,9 @@ typedef struct
 
 CFG_TUSB_MEM_SECTION CFG_TUSB_MEM_ALIGN static mscd_interface_t _mscd_itf;
 CFG_TUSB_MEM_SECTION CFG_TUSB_MEM_ALIGN static uint8_t _mscd_buf[CFG_TUD_MSC_EP_BUFSIZE];
+#if CFG_TUD_MSC_DEFERRED_WRITE_RETRY
+static uint32_t _write10_retry_generation_seed;
+#endif
 
 //--------------------------------------------------------------------+
 // INTERNAL OBJECT & FUNCTION DECLARATION
@@ -82,6 +96,22 @@ static void proc_read10_cmd(uint8_t rhport, mscd_interface_t* p_msc);
 
 static void proc_write10_cmd(uint8_t rhport, mscd_interface_t* p_msc);
 static void proc_write10_new_data(uint8_t rhport, mscd_interface_t* p_msc, uint32_t xferred_bytes);
+
+#if CFG_TUD_MSC_DEFERRED_WRITE_RETRY
+static uint32_t next_write10_retry_generation(void)
+{
+  _write10_retry_generation_seed++;
+  if (_write10_retry_generation_seed == 0) _write10_retry_generation_seed++;
+  return _write10_retry_generation_seed;
+}
+
+static void clear_write10_retry(mscd_interface_t* p_msc)
+{
+  p_msc->write10_retry_pending = false;
+  p_msc->write10_retry_bytes = 0;
+  p_msc->write10_retry_generation = 0;
+}
+#endif
 
 TU_ATTR_ALWAYS_INLINE static inline bool is_data_in(uint8_t dir)
 {
@@ -111,6 +141,9 @@ static void fail_scsi_op(uint8_t rhport, mscd_interface_t* p_msc, uint8_t status
   p_csw->status       = status;
   p_csw->data_residue = p_msc->cbw.total_bytes - p_msc->xferred_len;
   p_msc->stage        = MSC_STAGE_STATUS;
+#if CFG_TUD_MSC_DEFERRED_WRITE_RETRY
+  clear_write10_retry(p_msc);
+#endif
 
   // failed but sense key is not set: default to Illegal Request
   if ( p_msc->sense_key == 0 ) tud_msc_set_sense(p_cbw->lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0x00);
@@ -239,6 +272,38 @@ bool tud_msc_set_sense(uint8_t lun, uint8_t sense_key, uint8_t add_sense_code, u
   return true;
 }
 
+#if CFG_TUD_MSC_DEFERRED_WRITE_RETRY
+bool tud_msc_write10_retry_snapshot(uint32_t* generation)
+{
+  TU_VERIFY(generation != NULL, false);
+  if (!_mscd_itf.write10_retry_pending) return false;
+
+  *generation = _mscd_itf.write10_retry_generation;
+  return true;
+}
+
+bool tud_msc_write10_retry(uint32_t generation)
+{
+  mscd_interface_t* p_msc = &_mscd_itf;
+  if (!p_msc->write10_retry_pending ||
+      generation == 0 ||
+      p_msc->write10_retry_generation != generation)
+  {
+    return false;
+  }
+
+  uint8_t const rhport = p_msc->write10_retry_rhport;
+  uint32_t const xferred_bytes = p_msc->write10_retry_bytes;
+  clear_write10_retry(p_msc);
+
+  // Re-enter only the MSC class callback. Calling this through the device event
+  // queue would let each BUSY result immediately enqueue and consume its next
+  // retry in the same tud_task() call.
+  (void) mscd_xfer_cb(rhport, p_msc->ep_out, XFER_RESULT_SUCCESS, xferred_bytes);
+  return true;
+}
+#endif
+
 //--------------------------------------------------------------------+
 // USBD Driver API
 //--------------------------------------------------------------------+
@@ -251,6 +316,7 @@ void mscd_reset(uint8_t rhport)
 {
   (void) rhport;
   tu_memclr(&_mscd_itf, sizeof(mscd_interface_t));
+  if (tud_msc_reset_cb) tud_msc_reset_cb();
 }
 
 uint16_t mscd_open(uint8_t rhport, tusb_desc_interface_t const * itf_desc, uint16_t max_len)
@@ -283,10 +349,15 @@ static void proc_bot_reset(mscd_interface_t* p_msc)
   p_msc->stage       = MSC_STAGE_CMD;
   p_msc->total_len   = 0;
   p_msc->xferred_len = 0;
+#if CFG_TUD_MSC_DEFERRED_WRITE_RETRY
+  clear_write10_retry(p_msc);
+#endif
 
   p_msc->sense_key           = 0;
   p_msc->add_sense_code      = 0;
   p_msc->add_sense_qualifier = 0;
+
+  if (tud_msc_reset_cb) tud_msc_reset_cb();
 }
 
 // Invoked when a control transfer occurred on an interface of this class
@@ -408,6 +479,8 @@ bool mscd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t event, uint32_t
 
       TU_LOG(MSC_DEBUG, "  SCSI Command: %s\r\n", tu_lookup_find(&_msc_scsi_cmd_table, p_cbw->command[0]));
       //TU_LOG_MEM(MSC_DEBUG, p_cbw, xferred_bytes, 2);
+
+      if (tud_msc_command_begin_cb) tud_msc_command_begin_cb(p_cbw->lun, p_cbw->command);
 
       p_csw->signature    = MSC_CSW_SIGNATURE;
       p_csw->tag          = p_cbw->tag;
@@ -589,6 +662,8 @@ bool mscd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t event, uint32_t
             if ( tud_msc_scsi_complete_cb ) tud_msc_scsi_complete_cb(p_cbw->lun, p_cbw->command);
           break;
         }
+
+        if (tud_msc_command_complete_cb) tud_msc_command_complete_cb(p_cbw->lun, p_cbw->command);
 
         TU_ASSERT( prepare_cbw(rhport, p_msc) );
       }else
@@ -915,8 +990,19 @@ static void proc_write10_new_data(uint8_t rhport, mscd_interface_t* p_msc, uint3
         memmove(_mscd_buf, _mscd_buf+nbytes, xferred_bytes-nbytes);
       }
 
-      // simulate an transfer complete with adjusted parameters --> callback will be invoked with adjusted parameter
+      #if CFG_TUD_MSC_DEFERRED_WRITE_RETRY
+      // Retain the unconsumed endpoint data for one application-driven retry.
+      // Do not post a synthetic USB event: a callback that remains BUSY would
+      // otherwise replenish the queue while tud_task() drains it.
+      p_msc->write10_retry_rhport = rhport;
+      p_msc->write10_retry_bytes = xferred_bytes-nbytes;
+      p_msc->write10_retry_generation = next_write10_retry_generation();
+      p_msc->write10_retry_pending = true;
+      #else
+      // Default TinyUSB behavior: simulate a transfer complete so this class
+      // callback is invoked again with the adjusted parameters.
       dcd_event_xfer_complete(rhport, p_msc->ep_out, xferred_bytes-nbytes, XFER_RESULT_SUCCESS, false);
+      #endif
     }
     else
     {
