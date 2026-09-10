@@ -3,13 +3,24 @@ name: Build ESP
 on:
   pull_request:
   push:
+  workflow_dispatch:
   release:
     types:
       - created
 
+permissions:
+  contents: read
+
+env:
+  # TinyUSB 0.12's ESP examples use the IDF 4.4 USB HAL and legacy RMT APIs.
+  # "latest" tracks IDF development and no longer provides those APIs. Keep
+  # this legacy compatibility check pinned; IDF 4.4 is not a current SDK.
+  ESP_IDF_IMAGE: espressif/idf:v4.4.8@sha256:223a6bb14aaa0ca196a4a8d9fb24c5d71b85335e7617da062b5d12717708be9c
+
 jobs:
   build-esp:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -22,27 +33,44 @@ jobs:
 
     steps:
     - name: Setup Python
-      uses: actions/setup-python@v2
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      with:
+        python-version: '3.12'
 
     - name: Pull ESP-IDF docker
-      run: docker pull espressif/idf:latest
+      run: docker pull "$ESP_IDF_IMAGE"
 
     - name: Checkout TinyUSB
-      uses: actions/checkout@v2
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      with:
+        persist-credentials: false
 
     - name: Checkout hathach/linkermap
-      uses: actions/checkout@v2
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
       with:
-         repository: hathach/linkermap
-         path: linkermap
+        repository: hathach/linkermap
+        ref: 8e1f440fa15c567aceb5aa0d14f6d18c329cc67f
+        path: linkermap
+        persist-credentials: false
 
     - name: Build
-      run: docker run --rm -v $PWD:/project -w /project espressif/idf:latest python3 tools/build_esp32sx.py ${{ matrix.board }}
+      env:
+        BOARD: ${{ matrix.board }}
+      run: docker run --rm -v "$PWD:/project" -w /project "$ESP_IDF_IMAGE" python3 -u tools/build_esp32sx.py "$BOARD"
 
     - name: Linker Map
+      env:
+        BOARD: ${{ matrix.board }}
       run: |
-        pip install linkermap/
-        for ex in `ls -d examples/device/*/`; do \
-          find ${ex} -maxdepth 3 -name *.map -print -quit | \
-          xargs -I % sh -c 'echo "::group::%"; linkermap -v %; echo "::endgroup::"'; \
+        python -m pip install ./linkermap
+        shopt -s nullglob
+        maps=(examples/device/*/_build/"$BOARD"/*.map)
+        if ((${#maps[@]} == 0)); then
+          echo "::error::No linker maps found for $BOARD"
+          exit 1
+        fi
+        for map in "${maps[@]}"; do
+          echo "::group::$map"
+          linkermap -v "$map"
+          echo "::endgroup::"
         done
