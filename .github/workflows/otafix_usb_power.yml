@@ -1,0 +1,15 @@
+name: nRF5x USB power regression
+
+on: [push, pull_request]
+
+jobs:
+  host:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Actual handler and inherited-hang negative control
+        run: python3 -B test/otafix/nrf5x_power_test.py
+      - name: Address and undefined-behavior sanitizers
+        env:
+          USB_TEST_CXXFLAGS: -fsanitize=address,undefined -fno-omit-frame-pointer
+        run: python3 -B test/otafix/nrf5x_power_test.py

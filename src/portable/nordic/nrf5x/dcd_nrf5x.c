@@ -998,12 +998,27 @@ void tusb_hal_nrf_power_event (uint32_t event)
     break;
 
     case USB_EVT_READY:
-      // Skip if pull-up is enabled and HCLK is already running.
-      // Application probably call this more than necessary.
-      if ( NRF_USBD->USBPULLUP && hfclk_running() ) break;
+    {
+      // READY is a consumed event, not a persistent status bit. In particular,
+      // a post-SoftDevice callback may find USB already attached but HFCLK no
+      // longer requested by this context. Restore the clock before testing
+      // completion; do not wait for a second peripheral READY event.
+      uint32_t remaining = 100000;
+      if ( !NRF_USBD->ENABLE ) break;
+      hfclk_enable();
+      while ( !hfclk_running() )
+      {
+        if ( !NRF_USBD->ENABLE || !--remaining ) return;
+      }
 
-      // Waiting for USBD peripheral enabled
-      while ( !(USBD_EVENTCAUSE_READY_Msk & NRF_USBD->EVENTCAUSE) ) { }
+      // Recheck attachment inside the wait: another READY handler can preempt
+      // this one and consume EVENTCAUSE before it attaches. Both waits share
+      // a finite poll budget, independent of ticks/interrupts being available.
+      while ( !(USBD_EVENTCAUSE_READY_Msk & NRF_USBD->EVENTCAUSE) )
+      {
+        if ( NRF_USBD->USBPULLUP || !NRF_USBD->ENABLE || !--remaining ) return;
+      }
+      if ( NRF_USBD->USBPULLUP || !NRF_USBD->ENABLE ) break;
 
       NRF_USBD->EVENTCAUSE = USBD_EVENTCAUSE_READY_Msk;
       __ISB(); __DSB(); // for sync
@@ -1067,17 +1082,10 @@ void tusb_hal_nrf_power_event (uint32_t event)
         NVIC_EnableIRQ(USBD_IRQn);
       }
 
-      // USB_EVT_DETECTED may have requested HFCLK before the SoftDevice took
-      // ownership of CLOCK. Request it again in the current context so this
-      // post-SoftDevice READY path cannot wait forever.
-      hfclk_enable();
-
-      // Wait for HFCLK
-      while ( !hfclk_running() ) { }
-
       // Enable pull up
-      NRF_USBD->USBPULLUP = 1;
+      if ( NRF_USBD->ENABLE ) NRF_USBD->USBPULLUP = 1;
       __ISB(); __DSB(); // for sync
+    }
     break;
 
     case USB_EVT_REMOVED:
