@@ -10,7 +10,7 @@ on:
 jobs:
   trigger-mynewt:
     if: github.repository == 'hathach/tinyusb'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
     - name: Trigger mynewt-tinyusb-example
       shell: bash
@@ -19,10 +19,10 @@ jobs:
 
   mirror-tinyusb-src:
     if: github.repository == 'hathach/tinyusb'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
     - name: Checkout code
-      uses: actions/checkout@v2
+      uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
     - name: Push to tinyusb_src
       run: |
