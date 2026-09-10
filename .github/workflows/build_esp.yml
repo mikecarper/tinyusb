@@ -71,6 +71,8 @@ jobs:
         fi
         for map in "${maps[@]}"; do
           echo "::group::$map"
-          linkermap -v "$map"
+          # ESP-IDF uses these names instead of plain .text/.data/.bss.
+          linkermap -v -s .flash.text -s .flash.rodata \
+            -s .iram0.text -s .iram0.vectors -s .dram0.data -s .dram0.bss "$map"
           echo "::endgroup::"
         done
