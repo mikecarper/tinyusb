@@ -7,6 +7,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+      - name: Complete-suite CI status regression tests
+        run: python3 -B test/otafix/ci_status_test.py
       - name: Actual handler and inherited-hang negative control
         run: python3 -B test/otafix/nrf5x_power_test.py
       - name: Address and undefined-behavior sanitizers
