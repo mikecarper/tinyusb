@@ -68,6 +68,10 @@ static void NVIC_EnableIRQ(unsigned) { irq_enabled = true; }
 static void NVIC_DisableIRQ(unsigned) { irq_enabled = false; }
 static bool tud_inited() { return true; }
 static bool is_in_isr() { return false; }
+// DMA ownership is exercised by nrf5x_dma_test.py; these tests isolate power.
+static struct { uint32_t dma_pending; } _dcd;
+static bool dma_wait_end(uint32_t) { return true; }
+static void edpt_dma_end() {}
 static void dcd_event_bus_signal(unsigned, unsigned, bool) { ++unplugged; }
 
 /* DRIVER_FUNCTION */
@@ -78,6 +82,7 @@ static void reset() {
   auto_ready = clock_ok = true;
   clock_requested = irq_enabled = false;
   clock_reads = clock_delay = clock_requests = ready_reads = unplugged = 0;
+  _dcd.dma_pending = 0;
 }
 static void detected() { tusb_hal_nrf_power_event(0); }
 static void ready() { tusb_hal_nrf_power_event(2); }
@@ -161,7 +166,9 @@ int main(int argc, char** argv) {
 
 
 def extract_handler(source):
-    start = source.index("void tusb_hal_nrf_power_event")
+    definition = re.search(r"void tusb_hal_nrf_power_event\s*\([^;{}]*\)\s*\{", source)
+    assert definition is not None
+    start = definition.start()
     opening = source.index("{", start)
     depth = 1
     cursor = opening + 1

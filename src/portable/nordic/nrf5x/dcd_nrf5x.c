@@ -34,9 +34,11 @@
 #include "nrfx_usbd_errata.h"
 #include "device/dcd.h"
 
-// TODO remove later
 #include "device/usbd.h"
-#include "device/usbd_pvt.h" // to use defer function helper
+
+#ifndef CFG_TUD_NRF5X_ISO
+#define CFG_TUD_NRF5X_ISO 1
+#endif
 
 /*------------------------------------------------------------------*/
 /* MACRO TYPEDEF CONSTANT ENUM
@@ -48,7 +50,7 @@ enum
 
   // Mask of all END event (IN & OUT) for all endpoints. ENDEPIN0-7, ENDEPOUT0-7, ENDISOIN, ENDISOOUT
   EDPT_END_ALL_MASK = (0xff << USBD_INTEN_ENDEPIN0_Pos) | (0xff << USBD_INTEN_ENDEPOUT0_Pos) |
-                      USBD_INTENCLR_ENDISOIN_Msk | USBD_INTEN_ENDISOOUT_Msk
+                      ((CFG_TUD_NRF5X_ISO) ? (USBD_INTENCLR_ENDISOIN_Msk | USBD_INTEN_ENDISOOUT_Msk) : 0)
 };
 
 enum
@@ -57,6 +59,15 @@ enum
   EP_CBI_COUNT = 8  // Control Bulk Interrupt endpoints count
 };
 
+enum {
+  DMA_EP0_STATUS = 0,
+  DMA_EP0_RCVOUT = 1,
+  DMA_IN_BASE    = USBD_INTEN_ENDEPIN0_Pos,
+  DMA_OUT_BASE   = USBD_INTEN_ENDEPOUT0_Pos,
+  OUT_HALTED     = 2,
+};
+#define DMA_EP0_MASK (TU_BIT(DMA_IN_BASE) | TU_BIT(DMA_OUT_BASE) | 3u)
+#define DMA_ALL_MASK (EDPT_END_ALL_MASK | 3u)
 // Transfer Descriptor
 typedef struct
 {
@@ -67,7 +78,7 @@ typedef struct
 
   // nRF will auto accept OUT packet after DMA is done
   // indicate packet is already ACK
-  volatile bool data_received;
+  volatile uint8_t data_received; // 0: empty, 1: received, 2: halted
 
   // Set to true when data was transferred from RAM to ISO IN output buffer.
   // New data can be put in ISO IN output buffer after SOF.
@@ -80,12 +91,51 @@ static struct
 {
   // All 8 endpoints including control IN & OUT (offset 1)
   // +1 for ISO endpoints
-  xfer_td_t xfer[EP_CBI_COUNT + 1][2];
+  xfer_td_t xfer[EP_CBI_COUNT + CFG_TUD_NRF5X_ISO][2];
 
   // nRF can only carry one DMA at a time, this is used to guard the access to EasyDMA
-  volatile bool dma_running;
+  volatile uint32_t dma_active; // one-hot END event of the DMA that owns the channel
+  volatile uint8_t setup_dir; // captured with SETUP; its registers are unreadable during an OUT DMA
+  uint32_t dma_pending;
 }_dcd;
 
+void tusb_hal_nrf_power_event(uint32_t event);
+
+// Nordic anomaly 199, matching nrfx's usbd_dma_pending_set/clear(). Only real
+// EasyDMA transfers use the latch; EP0STATUS and EP0RCVOUT do not move data.
+#define NRF_USBD_ERRATA_199_REG (*((volatile uint32_t *)0x40027C1CUL))
+
+// The IRQ consumes events; a bounded DMA wait only observes them so the normal
+// completion handler retains ownership of their transfer accounting.
+static uint32_t usbd_events(uint32_t mask, bool consume) {
+  volatile uint32_t *events = &NRF_USBD->EVENTS_USBRESET;
+  uint32_t           status = 0;
+  for (uint8_t i = 0; mask; i++, mask >>= 1) {
+    if ((mask & 1u) && events[i]) {
+      status |= TU_BIT(i);
+      if (consume) {
+        events[i] = 0;
+        __ISB();
+        __DSB();
+      }
+    }
+  }
+  return status;
+}
+
+static bool dma_wait_end(uint32_t captured) {
+  const uint32_t active = _dcd.dma_active;
+  if (!active || (captured & active)) {
+    return true;
+  }
+  for (uint8_t scans = 0; scans < 21; scans++) {
+    // Scan the full window so the bounded wait does not shrink for low EPs.
+    if (!_dcd.dma_active || (usbd_events(EDPT_END_ALL_MASK | USBD_INTEN_ENDISOOUT_Msk, false) & active)) {
+      return true;
+    }
+  }
+  return false;
+}
 /*------------------------------------------------------------------*/
 /* Control / Bulk / Interrupt (CBI) Transfer
  *------------------------------------------------------------------*/
@@ -111,128 +161,146 @@ TU_ATTR_ALWAYS_INLINE static inline bool is_in_isr(void)
   return (SCB->ICSR & SCB_ICSR_VECTACTIVE_Msk) ? true : false;
 }
 
-// helper to start DMA
-static void start_dma(volatile uint32_t* reg_startep)
-{
-  _dcd.dma_running = true;
-
-  (*reg_startep) = 1;
-  __ISB(); __DSB();
-
-  // TASKS_EP0STATUS, TASKS_EP0RCVOUT seem to need EasyDMA to be available
-  // However these don't trigger any DMA transfer and got ENDED event subsequently
-  // Therefore dma_pending is corrected right away
-  if ( (reg_startep == &NRF_USBD->TASKS_EP0STATUS) || (reg_startep == &NRF_USBD->TASKS_EP0RCVOUT) )
-  {
-    _dcd.dma_running = false;
+static __attribute__((noinline)) void dma_errata_199(uint32_t value) {
+  if (nrfx_usbd_errata_199()) {
+    NRF_USBD_ERRATA_199_REG = value;
   }
 }
 
-// only 1 EasyDMA can be active at any time
-// TODO use Cortex M4 LDREX and STREX command (atomic) to have better mutex access to EasyDMA
-// since current implementation does not 100% guarded against race condition
-static void edpt_dma_start(volatile uint32_t* reg_startep)
-{
-  // Called in critical section i.e within USB ISR, or USB/Global interrupt disabled
-  if ( is_in_isr() || __get_PRIMASK() || !NVIC_GetEnableIRQ(USBD_IRQn) )
-  {
-    if (_dcd.dma_running)
-    {
-      //use usbd task to defer later
-      usbd_defer_func((osal_task_func_t) edpt_dma_start, (void*) (uintptr_t) reg_startep, true);
-    }else
-    {
-      start_dma(reg_startep);
-    }
-  }else
-  {
-    // Called in non-critical thread-mode, should be 99% of the time.
-    // Should be safe to blocking wait until previous DMA transfer complete
-    uint8_t const rhport = 0;
-    bool started = false;
-    while(!started)
-    {
-      // LDREX/STREX may be needed in form of std atomic (required C11) or
-      // use osal mutex to guard against multiple core MCUs such as nRF53
-      dcd_int_disable(rhport);
+static void edpt_dma_end(void);
 
-      if ( !_dcd.dma_running )
-      {
-        start_dma(reg_startep);
-        started = true;
-      }
-
-      dcd_int_enable(rhport);
-
-      // osal_yield();
-    }
-  }
+// helper to start DMA
+// Caller holds the short global task-commit lock; no polling occurs here.
+static void start_dma(volatile uint32_t *reg_startep) {
+  *reg_startep = 1;
+  __ISB();
+  __DSB();
 }
 
 // DMA is complete
-static void edpt_dma_end(void)
-{
-  TU_ASSERT(_dcd.dma_running, );
-  _dcd.dma_running = false;
+static void edpt_dma_end(void) {
+  dma_errata_199(0);
+  _dcd.dma_active = 0;
 }
 
 // helper getting td
-static inline xfer_td_t* get_td(uint8_t epnum, uint8_t dir)
-{
+static inline xfer_td_t *get_td(uint8_t epnum, uint8_t dir) {
   return &_dcd.xfer[epnum][dir];
 }
 
-// Start DMA to move data from Endpoint -> RAM
-static void xact_out_dma(uint8_t epnum)
-{
-  xfer_td_t* xfer = get_td(epnum, TUSB_DIR_OUT);
-  uint32_t xact_len;
-
-  if (epnum == EP_ISO_NUM)
-  {
-    xact_len = NRF_USBD->SIZE.ISOOUT;
-    // If ZERO bit is set, ignore ISOOUT length
-    if (xact_len & USBD_SIZE_ISOOUT_ZERO_Msk)
+// Serialize the current descriptor only when it owns the free DMA channel.
+static void dma_start_transfer(uint8_t epnum, uint8_t dir) {
+  xfer_td_t         *xfer = get_td(epnum, dir);
+  volatile uint32_t *regs;
+  volatile uint32_t *task;
+  uint32_t           limit;
+  if (dir == TUSB_DIR_OUT) {
+#if CFG_TUD_NRF5X_ISO
+    if (epnum == EP_ISO_NUM) {
+      limit = NRF_USBD->SIZE.ISOOUT;
+      if (limit & USBD_SIZE_ISOOUT_ZERO_Msk) {
+        _dcd.dma_active = 0;
+        return;
+      }
+      regs = &NRF_USBD->ISOOUT.PTR;
+      task = &NRF_USBD->TASKS_STARTISOOUT;
+    } else
+#endif
     {
-      xact_len = 0;
+      limit = NRF_USBD->SIZE.EPOUT[epnum];
+      regs  = &NRF_USBD->EPOUT[epnum].PTR;
+      task  = &NRF_USBD->TASKS_STARTEPOUT[epnum];
     }
-    else
-    {
-      // Trigger DMA move data from Endpoint -> SRAM
-      NRF_USBD->ISOOUT.PTR = (uint32_t) xfer->buffer;
-      NRF_USBD->ISOOUT.MAXCNT = xact_len;
-
-      edpt_dma_start(&NRF_USBD->TASKS_STARTISOOUT);
-    }
+  } else {
+    limit = xfer->mps;
+    regs  = (CFG_TUD_NRF5X_ISO && epnum == EP_ISO_NUM) ? &NRF_USBD->ISOIN.PTR : &NRF_USBD->EPIN[epnum].PTR;
+    task = (CFG_TUD_NRF5X_ISO && epnum == EP_ISO_NUM) ? &NRF_USBD->TASKS_STARTISOIN : &NRF_USBD->TASKS_STARTEPIN[epnum];
   }
-  else
-  {
-    // limit xact len to remaining length
-    xact_len = tu_min16((uint16_t) NRF_USBD->SIZE.EPOUT[epnum], xfer->total_len - xfer->actual_len);
+  regs[0] = (uint32_t)xfer->buffer;
+  regs[1] = tu_min16((uint16_t)limit, xfer->total_len - xfer->actual_len);
+  dma_errata_199(0x82);
+  start_dma(task);
+}
 
-    // Trigger DMA move data from Endpoint -> SRAM
-    NRF_USBD->EPOUT[epnum].PTR = (uint32_t) xfer->buffer;
-    NRF_USBD->EPOUT[epnum].MAXCNT = xact_len;
-
-    edpt_dma_start(&NRF_USBD->TASKS_STARTEPOUT[epnum]);
+// Pending operations refer to the current descriptor, never a queued buffer or
+// register snapshot. Cancelled work therefore cannot revive after clear-halt.
+static void dma_dispatch(void) {
+  for (;;) {
+    // Power removal can preempt USBD. Snapshot and commit one operation with
+    // all interrupts masked, then restore them before another operation.
+    // There are no DMA waits or host callbacks inside this short window.
+    const uint32_t saved = __get_PRIMASK();
+    __disable_irq();
+    const uint32_t pending = _dcd.dma_pending;
+    if (!NRF_USBD->ENABLE || _dcd.dma_active || !pending) {
+      __set_PRIMASK(saved);
+      return;
+    }
+    const uint8_t  operation = __builtin_ctz(pending);
+    const uint32_t bit       = TU_BIT(operation);
+    _dcd.dma_pending         = pending & ~bit;
+    if (operation == DMA_EP0_STATUS) {
+      start_dma(&NRF_USBD->TASKS_EP0STATUS);
+    } else if (operation == DMA_EP0_RCVOUT) {
+      start_dma(&NRF_USBD->TASKS_EP0RCVOUT);
+    } else {
+      const uint8_t dir   = operation >= DMA_OUT_BASE ? TUSB_DIR_OUT : TUSB_DIR_IN;
+      const uint8_t epnum = operation - (dir == TUSB_DIR_OUT ? DMA_OUT_BASE : DMA_IN_BASE) -
+                            (CFG_TUD_NRF5X_ISO && operation == USBD_INTEN_ENDISOIN_Pos);
+      if (dir == TUSB_DIR_IN || get_td(epnum, dir)->data_received != OUT_HALTED) {
+        _dcd.dma_active = bit;
+        dma_start_transfer(epnum, dir);
+      }
+    }
+    __set_PRIMASK(saved);
   }
 }
 
-// Prepare for a CBI transaction IN, call at the start
-// it start DMA to transfer data from RAM -> Endpoint
-static void xact_in_dma(uint8_t epnum)
-{
-  xfer_td_t* xfer = get_td(epnum, TUSB_DIR_IN);
-
-  // Each transaction is up to Max Packet Size
-  uint16_t const xact_len = tu_min16(xfer->total_len - xfer->actual_len, xfer->mps);
-
-  NRF_USBD->EPIN[epnum].PTR    = (uint32_t) xfer->buffer;
-  NRF_USBD->EPIN[epnum].MAXCNT = xact_len;
-
-  edpt_dma_start(&NRF_USBD->TASKS_STARTEPIN[epnum]);
+static void dma_cancel(uint32_t operations) {
+  const uint32_t saved = __get_PRIMASK();
+  __disable_irq();
+  _dcd.dma_pending &= ~operations;
+  __set_PRIMASK(saved);
 }
 
+static void dma_request(uint8_t operation) {
+  const uint32_t saved = __get_PRIMASK();
+  __disable_irq();
+  if (NRF_USBD->ENABLE) {
+    _dcd.dma_pending |= TU_BIT(operation);
+  }
+  __set_PRIMASK(saved);
+  // An ISR must finish accounting its captured END before a new DMA starts.
+  if (is_in_isr()) {
+    NVIC_SetPendingIRQ(USBD_IRQn);
+  } else {
+    dma_dispatch();
+  }
+}
+
+static void xact_out_dma(uint8_t epnum) {
+  dma_request(DMA_OUT_BASE + epnum);
+}
+
+static void xact_in_dma(uint8_t epnum) {
+  dma_request(DMA_IN_BASE + epnum + (CFG_TUD_NRF5X_ISO && epnum == EP_ISO_NUM));
+}
+
+// Called with USBD IRQ masked. A retired buffer must be out of hardware's hands
+// before its descriptor can be reused. Its END is acknowledged without a stale
+// completion, while another endpoint's DMA and pending work remain owned.
+static bool dma_retire(uint32_t operations) {
+  dma_cancel(operations);
+  if (operations & _dcd.dma_active) {
+    if (!dma_wait_end(0)) {
+      tusb_hal_nrf_power_event(1);
+      return false;
+    }
+    usbd_events(_dcd.dma_active, true);
+    edpt_dma_end();
+  }
+  return true;
+}
 //--------------------------------------------------------------------+
 // Controller API
 //--------------------------------------------------------------------+
@@ -308,9 +376,15 @@ bool dcd_edpt_open (uint8_t rhport, tusb_desc_endpoint_t const * desc_edpt)
   uint8_t const epnum   = tu_edpt_number(ep_addr);
   uint8_t const dir     = tu_edpt_dir(ep_addr);
 
+#if !CFG_TUD_NRF5X_ISO
+  TU_VERIFY(epnum < EP_CBI_COUNT && desc_edpt->bmAttributes.xfer != TUSB_XFER_ISOCHRONOUS);
+#endif
+
   _dcd.xfer[epnum][dir].mps = tu_edpt_packet_size(desc_edpt);
 
+#if CFG_TUD_NRF5X_ISO
   if (desc_edpt->bmAttributes.xfer != TUSB_XFER_ISOCHRONOUS)
+#endif
   {
     if (dir == TUSB_DIR_OUT)
     {
@@ -325,6 +399,8 @@ bool dcd_edpt_open (uint8_t rhport, tusb_desc_endpoint_t const * desc_edpt)
       NRF_USBD->EPINEN  |= TU_BIT(epnum);
     }
   }
+#if CFG_TUD_NRF5X_ISO
+
   else
   {
     TU_ASSERT(epnum == EP_ISO_NUM);
@@ -358,6 +434,8 @@ bool dcd_edpt_open (uint8_t rhport, tusb_desc_endpoint_t const * desc_edpt)
       NRF_USBD->EPINEN  |= USBD_EPINEN_ISOIN_Msk;
     }
   }
+#endif
+
 
   // clear stall and reset DataToggle
   NRF_USBD->EPSTALL = (USBD_EPSTALL_STALL_UnStall << USBD_EPSTALL_STALL_Pos) | ep_addr;
@@ -368,46 +446,50 @@ bool dcd_edpt_open (uint8_t rhport, tusb_desc_endpoint_t const * desc_edpt)
   return true;
 }
 
-void dcd_edpt_close_all (uint8_t rhport)
-{
-  // disable interrupt to prevent race condition
+void dcd_edpt_close_all(uint8_t rhport) {
+  // Retire every non-control buffer before clearing its descriptor.
+  const bool enabled = NVIC_GetEnableIRQ(USBD_IRQn);
   dcd_int_disable(rhport);
-
-  // disable all non-control (bulk + interrupt) endpoints
-  for ( uint8_t ep = 1; ep < EP_CBI_COUNT; ep++ )
-  {
-    NRF_USBD->INTENCLR = TU_BIT(USBD_INTEN_ENDEPOUT0_Pos + ep) | TU_BIT(USBD_INTEN_ENDEPIN0_Pos + ep);
-
-    NRF_USBD->TASKS_STARTEPIN[ep] = 0;
-    NRF_USBD->TASKS_STARTEPOUT[ep] = 0;
-
-    tu_memclr(_dcd.xfer[ep], 2*sizeof(xfer_td_t));
+  if (!dma_retire(DMA_ALL_MASK & ~DMA_EP0_MASK)) {
+    return;
   }
 
-  // disable both ISO
-  NRF_USBD->INTENCLR = USBD_INTENCLR_SOF_Msk | USBD_INTENCLR_ENDISOOUT_Msk | USBD_INTENCLR_ENDISOIN_Msk;
+  // Disable all non-control endpoints, including ISO. TASKS writes of zero
+  // cannot stop DMA; only a write of one triggers a Nordic task.
+  NRF_USBD->INTENCLR = (0xfeu << USBD_INTEN_ENDEPOUT0_Pos) | (0xfeu << USBD_INTEN_ENDEPIN0_Pos) |
+                       USBD_INTENCLR_SOF_Msk |
+                       (CFG_TUD_NRF5X_ISO ? (USBD_INTENCLR_ENDISOOUT_Msk | USBD_INTENCLR_ENDISOIN_Msk) : 0);
+#if CFG_TUD_NRF5X_ISO
   NRF_USBD->ISOSPLIT = USBD_ISOSPLIT_SPLIT_OneDir;
-
-  NRF_USBD->TASKS_STARTISOIN  = 0;
-  NRF_USBD->TASKS_STARTISOOUT = 0;
-
-  tu_memclr(_dcd.xfer[EP_ISO_NUM], 2*sizeof(xfer_td_t));
+#endif
+  tu_memclr(_dcd.xfer[1], sizeof(_dcd.xfer) - sizeof(_dcd.xfer[0]));
 
   // de-activate all non-control
   NRF_USBD->EPOUTEN = 1UL;
-  NRF_USBD->EPINEN = 1UL;
+  NRF_USBD->EPINEN  = 1UL;
 
-  dcd_int_enable(rhport);
+  if (enabled && NRF_USBD->ENABLE) {
+    dcd_int_enable(rhport);
+  }
 }
-
 void dcd_edpt_close (uint8_t rhport, uint8_t ep_addr)
 {
   (void) rhport;
 
   uint8_t const epnum = tu_edpt_number(ep_addr);
   uint8_t const dir   = tu_edpt_dir(ep_addr);
+#if !CFG_TUD_NRF5X_ISO
+  TU_VERIFY(epnum < EP_CBI_COUNT, );
+#endif
+  bool const enabled = NVIC_GetEnableIRQ(USBD_IRQn);
+  dcd_int_disable(rhport);
+  if (!dma_retire(TU_BIT(epnum + (dir == TUSB_DIR_OUT ? DMA_OUT_BASE : DMA_IN_BASE) +
+                         (CFG_TUD_NRF5X_ISO && dir == TUSB_DIR_IN && epnum == EP_ISO_NUM)))) return;
 
+
+#if CFG_TUD_NRF5X_ISO
   if (epnum != EP_ISO_NUM)
+#endif
   {
     // CBI
     if (dir == TUSB_DIR_OUT)
@@ -421,6 +503,8 @@ void dcd_edpt_close (uint8_t rhport, uint8_t ep_addr)
       NRF_USBD->EPINEN &= ~TU_BIT(epnum);
     }
   }
+#if CFG_TUD_NRF5X_ISO
+
   else
   {
     _dcd.xfer[EP_ISO_NUM][dir].mps = 0;
@@ -441,7 +525,10 @@ void dcd_edpt_close (uint8_t rhport, uint8_t ep_addr)
     // When both ISO endpoint are close there is no need for SOF any more.
     if (_dcd.xfer[EP_ISO_NUM][TUSB_DIR_IN].mps + _dcd.xfer[EP_ISO_NUM][TUSB_DIR_OUT].mps == 0) NRF_USBD->INTENCLR = USBD_INTENCLR_SOF_Msk;
   }
+#endif
+
   __ISB(); __DSB();
+  if (enabled && NRF_USBD->ENABLE) dcd_int_enable(rhport);
 }
 
 bool dcd_edpt_xfer (uint8_t rhport, uint8_t ep_addr, uint8_t * buffer, uint16_t total_bytes)
@@ -450,6 +537,9 @@ bool dcd_edpt_xfer (uint8_t rhport, uint8_t ep_addr, uint8_t * buffer, uint16_t 
 
   uint8_t const epnum = tu_edpt_number(ep_addr);
   uint8_t const dir   = tu_edpt_dir(ep_addr);
+#if !CFG_TUD_NRF5X_ISO
+  TU_VERIFY(epnum < EP_CBI_COUNT, false);
+#endif
 
   xfer_td_t* xfer = get_td(epnum, dir);
 
@@ -458,12 +548,12 @@ bool dcd_edpt_xfer (uint8_t rhport, uint8_t ep_addr, uint8_t * buffer, uint16_t 
   xfer->actual_len = 0;
 
   // Control endpoint with zero-length packet and opposite direction to 1st request byte --> status stage
-  bool const control_status = (epnum == 0 && total_bytes == 0 && dir != tu_edpt_dir(NRF_USBD->BMREQUESTTYPE));
+  bool const control_status = (epnum == 0 && total_bytes == 0 && dir != _dcd.setup_dir);
 
   if ( control_status )
   {
     // Status Phase also requires EasyDMA has to be available as well !!!!
-    edpt_dma_start(&NRF_USBD->TASKS_EP0STATUS);
+    dma_request(DMA_EP0_STATUS);
 
     // The nRF doesn't interrupt on status transmit so we queue up a success response.
     dcd_event_xfer_complete(0, ep_addr, 0, XFER_RESULT_SUCCESS, is_in_isr());
@@ -473,10 +563,10 @@ bool dcd_edpt_xfer (uint8_t rhport, uint8_t ep_addr, uint8_t * buffer, uint16_t 
     if ( epnum == 0 )
     {
       // Accept next Control Out packet. TASKS_EP0RCVOUT also require EasyDMA
-      edpt_dma_start(&NRF_USBD->TASKS_EP0RCVOUT);
+      dma_request(DMA_EP0_RCVOUT);
     }else
     {
-      if ( xfer->data_received )
+      if (xfer->data_received == 1)
       {
         // Data is already received previously
         // start DMA to copy to SRAM
@@ -499,75 +589,80 @@ bool dcd_edpt_xfer (uint8_t rhport, uint8_t ep_addr, uint8_t * buffer, uint16_t 
   return true;
 }
 
-void dcd_edpt_stall (uint8_t rhport, uint8_t ep_addr)
-{
-  (void) rhport;
+void dcd_edpt_stall(uint8_t rhport, uint8_t ep_addr) {
+  const uint8_t epnum = tu_edpt_number(ep_addr);
+  const uint8_t dir   = tu_edpt_dir(ep_addr);
+#if !CFG_TUD_NRF5X_ISO
+  TU_VERIFY(epnum < EP_CBI_COUNT, );
+#endif
+  bool const enabled = NVIC_GetEnableIRQ(USBD_IRQn);
+  dcd_int_disable(rhport);
 
-  uint8_t const epnum = tu_edpt_number(ep_addr);
-  uint8_t const dir   = tu_edpt_dir(ep_addr);
-
-  xfer_td_t* xfer = get_td(epnum, dir);
-
-  if ( epnum == 0 )
-  {
+  if (epnum == 0) {
+    if (!dma_retire(DMA_EP0_MASK)) {
+      return;
+    }
     NRF_USBD->TASKS_EP0STALL = 1;
-  }else if (epnum != EP_ISO_NUM)
-  {
+  } else if (epnum != EP_ISO_NUM) {
     NRF_USBD->EPSTALL = (USBD_EPSTALL_STALL_Stall << USBD_EPSTALL_STALL_Pos) | ep_addr;
-
-    // Note: nRF can auto ACK packet OUT before get stalled.
-    // There maybe data in endpoint fifo already, we need to pull it out
-    if ( (dir == TUSB_DIR_OUT) && xfer->data_received )
-    {
-      xfer->data_received = false;
-      xact_out_dma(epnum);
+    if (dir == TUSB_DIR_OUT) {
+      xfer_td_t *xfer     = get_td(epnum, dir);
+      xfer->data_received = OUT_HALTED;
+      if (!dma_retire(TU_BIT(DMA_OUT_BASE + epnum))) {
+        return;
+      }
+      xfer->total_len = xfer->actual_len = 0;
     }
   }
-
-  __ISB(); __DSB();
+  __ISB();
+  __DSB();
+  if (enabled && NRF_USBD->ENABLE) {
+    dcd_int_enable(rhport);
+  }
 }
 
-void dcd_edpt_clear_stall (uint8_t rhport, uint8_t ep_addr)
-{
-  (void) rhport;
-  uint8_t const epnum = tu_edpt_number(ep_addr);
-  uint8_t const dir   = tu_edpt_dir(ep_addr);
+void dcd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr) {
+  const uint8_t epnum = tu_edpt_number(ep_addr);
+  const uint8_t dir   = tu_edpt_dir(ep_addr);
+#if !CFG_TUD_NRF5X_ISO
+  TU_VERIFY(epnum < EP_CBI_COUNT, );
+#endif
+  if (epnum == 0 || epnum == EP_ISO_NUM) {
+    return;
+  }
 
-  if ( epnum != 0 && epnum != EP_ISO_NUM )
-  {
-    // reset data toggle to DATA0
-    // First write this register with VALUE=Nop to select the endpoint, then either read it to get the status from
-    // VALUE, or write it again with VALUE=Data0 or Data1
-    NRF_USBD->DTOGGLE = ep_addr;
-    NRF_USBD->DTOGGLE = (USBD_DTOGGLE_VALUE_Data0 << USBD_DTOGGLE_VALUE_Pos) | ep_addr;
-
-    // clear stall
-    NRF_USBD->EPSTALL = (USBD_EPSTALL_STALL_UnStall << USBD_EPSTALL_STALL_Pos) | ep_addr;
-
-    // Write any value to SIZE register will allow nRF to ACK/accept data
-    if (dir == TUSB_DIR_OUT) NRF_USBD->SIZE.EPOUT[epnum] = 0;
-
-    __ISB(); __DSB();
+  const bool enabled = NVIC_GetEnableIRQ(USBD_IRQn);
+  dcd_int_disable(rhport);
+  NRF_USBD->DTOGGLE = ep_addr;
+  NRF_USBD->DTOGGLE = (USBD_DTOGGLE_VALUE_Data0 << USBD_DTOGGLE_VALUE_Pos) | ep_addr;
+  if (dir == TUSB_DIR_OUT) {
+    get_td(epnum, dir)->data_received = 0;
+    NRF_USBD->EPDATASTATUS            = TU_BIT(16u + epnum);
+    NRF_USBD->SIZE.EPOUT[epnum]       = 0;
+  }
+  NRF_USBD->EPSTALL = (USBD_EPSTALL_STALL_UnStall << USBD_EPSTALL_STALL_Pos) | ep_addr;
+  __ISB();
+  __DSB();
+  if (enabled && NRF_USBD->ENABLE) {
+    dcd_int_enable(rhport);
   }
 }
 
 /*------------------------------------------------------------------*/
 /* Interrupt Handler
  *------------------------------------------------------------------*/
-void bus_reset(void)
-{
+static bool bus_reset(uint32_t captured) {
+  if (!dma_wait_end(captured)) {
+    // A reset may abort DMA without an END. Disable the peripheral before
+    // releasing its latch/buffers, and report the same boundary as unplug.
+    tusb_hal_nrf_power_event(1);
+    return false;
+  }
+  usbd_events(EDPT_END_ALL_MASK, true);
+  edpt_dma_end();
   // 6.35.6 USB controller automatically disabled all endpoints (except control)
   NRF_USBD->EPOUTEN = 1UL;
-  NRF_USBD->EPINEN = 1UL;
-
-  for(int i=0; i<8; i++)
-  {
-    NRF_USBD->TASKS_STARTEPIN[i] = 0;
-    NRF_USBD->TASKS_STARTEPOUT[i] = 0;
-  }
-
-  NRF_USBD->TASKS_STARTISOIN  = 0;
-  NRF_USBD->TASKS_STARTISOOUT = 0;
+  NRF_USBD->EPINEN  = 1UL;
 
   // Clear USB Event Interrupt
   NRF_USBD->EVENTS_USBEVENT = 0;
@@ -576,42 +671,30 @@ void bus_reset(void)
   // Reset interrupt
   NRF_USBD->INTENCLR = NRF_USBD->INTEN;
   NRF_USBD->INTENSET = USBD_INTEN_USBRESET_Msk | USBD_INTEN_USBEVENT_Msk | USBD_INTEN_EPDATA_Msk |
-          USBD_INTEN_EP0SETUP_Msk | USBD_INTEN_EP0DATADONE_Msk | USBD_INTEN_ENDEPIN0_Msk | USBD_INTEN_ENDEPOUT0_Msk;
+                       USBD_INTEN_EP0SETUP_Msk | USBD_INTEN_EP0DATADONE_Msk | USBD_INTEN_ENDEPIN0_Msk |
+                       USBD_INTEN_ENDEPOUT0_Msk;
 
   tu_varclr(&_dcd);
-  _dcd.xfer[0][TUSB_DIR_IN].mps = MAX_PACKET_SIZE;
+  _dcd.xfer[0][TUSB_DIR_IN].mps  = MAX_PACKET_SIZE;
   _dcd.xfer[0][TUSB_DIR_OUT].mps = MAX_PACKET_SIZE;
+  return true;
 }
-
 void dcd_int_handler(uint8_t rhport)
 {
   (void) rhport;
 
   uint32_t const inten  = NRF_USBD->INTEN;
-  uint32_t int_status = 0;
-
-  volatile uint32_t* regevt = &NRF_USBD->EVENTS_USBRESET;
-
-  for(uint8_t i=0; i<USBD_INTEN_EPDATA_Pos+1; i++)
-  {
-    if ( tu_bit_test(inten, i) && regevt[i]  )
-    {
-      int_status |= TU_BIT(i);
-
-      // event clear
-      regevt[i] = 0;
-      __ISB(); __DSB();
-    }
-  }
+  uint32_t const int_status = usbd_events(inten, true);
 
   if ( int_status & USBD_INTEN_USBRESET_Msk )
   {
-    bus_reset();
-    dcd_event_bus_reset(0, TUSB_SPEED_FULL, true);
+    if (bus_reset(int_status)) dcd_event_bus_reset(0, TUSB_SPEED_FULL, true);
+    return; // events captured with the reset belong to the retired transfers
   }
 
   // ISOIN: Data was moved to endpoint buffer, client will be notified in SOF
-  if ( int_status & USBD_INTEN_ENDISOIN_Msk )
+  #if CFG_TUD_NRF5X_ISO
+if ( int_status & USBD_INTEN_ENDISOIN_Msk )
   {
     xfer_td_t* xfer = get_td(EP_ISO_NUM, TUSB_DIR_IN);
 
@@ -620,13 +703,16 @@ void dcd_int_handler(uint8_t rhport)
     // Next transfer can be scheduled after SOF.
     xfer->iso_in_transfer_ready = true;
   }
+#endif
+
 
   if ( int_status & USBD_INTEN_SOF_Msk )
   {
     bool iso_enabled = false;
 
     // ISOOUT: Transfer data gathered in previous frame from buffer to RAM
-    if (NRF_USBD->EPOUTEN & USBD_EPOUTEN_ISOOUT_Msk)
+    #if CFG_TUD_NRF5X_ISO
+if (NRF_USBD->EPOUTEN & USBD_EPOUTEN_ISOOUT_Msk)
     {
       iso_enabled = true;
       xact_out_dma(EP_ISO_NUM);
@@ -644,6 +730,8 @@ void dcd_int_handler(uint8_t rhport)
         dcd_event_xfer_complete(0, EP_ISO_NUM | TUSB_DIR_IN_MASK, xfer->actual_len, XFER_RESULT_SUCCESS, true);
       }
     }
+#endif
+
 
     if ( !iso_enabled )
     {
@@ -692,27 +780,24 @@ void dcd_int_handler(uint8_t rhport)
   }
 
   // Setup tokens are specific to the Control endpoint.
-  if ( int_status & USBD_INTEN_EP0SETUP_Msk )
-  {
-    uint8_t const setup[8] =
-    {
-      NRF_USBD->BMREQUESTTYPE , NRF_USBD->BREQUEST, NRF_USBD->WVALUEL , NRF_USBD->WVALUEH,
-      NRF_USBD->WINDEXL       , NRF_USBD->WINDEXH , NRF_USBD->WLENGTHL, NRF_USBD->WLENGTHH
-    };
+  // nRF52840 can read zero SETUP registers during an OUT DMA (#4164).
+  // On timeout, drop this request rather than deliver a false zero packet.
+  if ((int_status & USBD_INTEN_EP0SETUP_Msk) && dma_wait_end(int_status) && NRF_USBD->ENABLE) {
+    const uint8_t setup[8] = {NRF_USBD->BMREQUESTTYPE, NRF_USBD->BREQUEST, NRF_USBD->WVALUEL,  NRF_USBD->WVALUEH,
+                              NRF_USBD->WINDEXL,       NRF_USBD->WINDEXH,  NRF_USBD->WLENGTHL, NRF_USBD->WLENGTHH};
+    dma_cancel(DMA_EP0_MASK);
+    _dcd.setup_dir = tu_edpt_dir(setup[0]);
 
     // nrf5x hw auto handle set address, there is no need to inform usb stack
-    tusb_control_request_t const * request = (tusb_control_request_t const *) setup;
+    const tusb_control_request_t *request = (const tusb_control_request_t *)setup;
 
-    if ( !(TUSB_REQ_RCPT_DEVICE   == request->bmRequestType_bit.recipient &&
-           TUSB_REQ_TYPE_STANDARD == request->bmRequestType_bit.type &&
-           TUSB_REQ_SET_ADDRESS   == request->bRequest) )
-    {
+    if (!(TUSB_REQ_RCPT_DEVICE == request->bmRequestType_bit.recipient &&
+          TUSB_REQ_TYPE_STANDARD == request->bmRequestType_bit.type && TUSB_REQ_SET_ADDRESS == request->bRequest)) {
       dcd_event_setup_received(0, setup, true);
     }
   }
 
-  if ( int_status & EDPT_END_ALL_MASK )
-  {
+  if (int_status & _dcd.dma_active) {
     // DMA complete move data from SRAM <-> Endpoint
     // Must before endpoint transfer handling
     edpt_dma_end();
@@ -754,11 +839,14 @@ void dcd_int_handler(uint8_t rhport)
    * len if Host decides to sent fewer bytes, it this case transaction is also
    * complete and next transfer is not initiated here like for CBI.
    */
-  for(uint8_t epnum=0; epnum<EP_CBI_COUNT+1; epnum++)
+  for(uint8_t epnum=0; epnum<EP_CBI_COUNT+CFG_TUD_NRF5X_ISO; epnum++)
   {
     if ( tu_bit_test(int_status, USBD_INTEN_ENDEPOUT0_Pos+epnum))
     {
       xfer_td_t* xfer = get_td(epnum, TUSB_DIR_OUT);
+      if (xfer->data_received == OUT_HALTED) {
+        continue;
+      }
       uint8_t const xact_len = NRF_USBD->EPOUT[epnum].AMOUNT;
 
       xfer->buffer     += xact_len;
@@ -770,7 +858,7 @@ void dcd_int_handler(uint8_t rhport)
         if ( epnum == 0 )
         {
           // Accept next Control Out packet. TASKS_EP0RCVOUT also require EasyDMA
-          edpt_dma_start(&NRF_USBD->TASKS_EP0RCVOUT);
+          dma_request(DMA_EP0_RCVOUT);
         }else
         {
           // nRF auto accept next Bulk/Interrupt OUT packet
@@ -797,14 +885,15 @@ void dcd_int_handler(uint8_t rhport)
 
     // EP0DATADONE is set with either Control Out on IN Data
     // Since EPDATASTATUS cannot be used to determine whether it is control OUT or IN.
-    // We will use BMREQUESTTYPE in setup packet to determine the direction
-    bool const is_control_in = (int_status & USBD_INTEN_EP0DATADONE_Msk) && (NRF_USBD->BMREQUESTTYPE & TUSB_DIR_IN_MASK);
-    bool const is_control_out = (int_status & USBD_INTEN_EP0DATADONE_Msk) && !(NRF_USBD->BMREQUESTTYPE & TUSB_DIR_IN_MASK);
+    // Use the direction captured before a later DMA can hide the SETUP registers.
+    if (int_status & USBD_INTEN_EP0DATADONE_Msk) {
+      data_status |= TU_BIT(_dcd.setup_dir == TUSB_DIR_OUT ? 16 : 0);
+    }
 
     // CBI In: Endpoint -> Host (transaction complete)
     for(uint8_t epnum=0; epnum<EP_CBI_COUNT; epnum++)
     {
-      if ( tu_bit_test(data_status, epnum) || (epnum == 0 && is_control_in) )
+      if ( tu_bit_test(data_status, epnum) )
       {
         xfer_td_t* xfer = get_td(epnum, TUSB_DIR_IN);
         uint8_t const xact_len = NRF_USBD->EPIN[epnum].AMOUNT;
@@ -827,9 +916,12 @@ void dcd_int_handler(uint8_t rhport)
     // CBI OUT: Host -> Endpoint
     for(uint8_t epnum=0; epnum<EP_CBI_COUNT; epnum++)
     {
-      if ( tu_bit_test(data_status, 16+epnum) || (epnum == 0 && is_control_out) )
+      if ( tu_bit_test(data_status, 16+epnum) )
       {
         xfer_td_t* xfer = get_td(epnum, TUSB_DIR_OUT);
+        if (xfer->data_received == OUT_HALTED) {
+          continue;
+        }
 
         if (xfer->actual_len < xfer->total_len)
         {
@@ -843,6 +935,8 @@ void dcd_int_handler(uint8_t rhport)
       }
     }
   }
+  dma_dispatch();
+
 }
 
 //--------------------------------------------------------------------+
@@ -1067,8 +1161,10 @@ void tusb_hal_nrf_power_event (uint32_t event)
 #endif
 
       // ISO buffer Lower half for IN, upper half for OUT
+#if CFG_TUD_NRF5X_ISO
       NRF_USBD->ISOSPLIT = USBD_ISOSPLIT_SPLIT_HalfIN;
 
+#endif
       // Enable bus-reset interrupt
       NRF_USBD->INTENSET = USBD_INTEN_USBRESET_Msk;
 
@@ -1103,8 +1199,12 @@ void tusb_hal_nrf_power_event (uint32_t event)
         // disable all interrupt
         NRF_USBD->INTENCLR = NRF_USBD->INTEN;
 
+        (void)dma_wait_end(0);
         NRF_USBD->ENABLE = 0;
         __ISB(); __DSB(); // for sync
+
+        _dcd.dma_pending = 0;
+        edpt_dma_end();
 
         hfclk_disable();
 

@@ -27,10 +27,32 @@ Local host regressions:
 ```sh
 python3 -B test/otafix/ci_status_test.py
 python3 -B test/otafix/nrf5x_power_test.py
+python3 -B test/otafix/nrf5x_dma_test.py
+python3 -B test/otafix/nrf5x_dma_test.py --iso 0
+python3 -B test/otafix/nrf5x_dma_test.py --errata-enabled 0
 python3 -B test/otafix/msc_status_test.py
 USB_TEST_CXXFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' \
   python3 -B test/otafix/nrf5x_power_test.py
+USB_TEST_CXXFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' \
+  python3 -B test/otafix/nrf5x_dma_test.py
 ```
+
+The DMA regression compiles the production Nordic controller and ISR with
+mocked hardware registers. It covers the anomaly 199 latch from
+[`4bbb23545`](https://github.com/hathach/tinyusb/commit/4bbb23545a91926b9372554f5a31294d0a279829),
+bounded SETUP/DMA synchronization and captured direction from
+[`8ec9bf6ab`](https://github.com/hathach/tinyusb/commit/8ec9bf6ab5acb7cfc4f9a4483828862ab044298f),
+and stale OUT recovery from
+[`e99616dd6`](https://github.com/hathach/tinyusb/commit/e99616dd618f836ccd9cd8030542417a18d658c5).
+The legacy driver also needs pending-operation cancellation and bounded DMA
+retirement so old queued or in-flight work cannot reuse a new descriptor.
+Scenarios exercise fresh packets after clear-halt, unrelated endpoints, reset,
+removal, and interrupt preemption in both priority directions. These are host
+regressions rather than physical USB qualification.
+
+ISO remains enabled by default in the generic driver. OTAFIX selects
+`CFG_TUD_NRF5X_ISO=0`; both configurations run the DMA suite, including endpoint
+bounds, ISO rejection when disabled, and retained remote-wakeup SOF behavior.
 
 The MSC status regression compiles the complete BOT driver and checks that a
 failed eject cannot complete media removal, including an eject rejected after
