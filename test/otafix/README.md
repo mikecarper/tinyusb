@@ -27,6 +27,13 @@ Local host regressions:
 ```sh
 python3 -B test/otafix/ci_status_test.py
 python3 -B test/otafix/nrf5x_power_test.py
+python3 -B test/otafix/msc_status_test.py
 USB_TEST_CXXFLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' \
   python3 -B test/otafix/nrf5x_power_test.py
 ```
+
+The MSC status regression compiles the complete BOT driver and checks that a
+failed eject cannot complete media removal, including an eject rejected after
+its acceptance callback because the host requested an unexpected data stage.
+READ10/WRITE10 and generic lifecycle callbacks still run after failed status.
+Its negative control restores the inherited callback and reproduces the exit.

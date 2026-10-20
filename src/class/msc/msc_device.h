@@ -165,7 +165,9 @@ TU_ATTR_WEAK void tud_msc_read10_complete_cb(uint8_t lun);
 // Invoke when Write10 command is complete, can be used to flush flash caching
 TU_ATTR_WEAK void tud_msc_write10_complete_cb(uint8_t lun);
 
-// Invoked when command in tud_msc_scsi_cb is complete
+// Invoked after a successful SCSI command other than READ10 and WRITE10 has
+// delivered its CSW to the host. Failed commands still invoke the generic
+// command-complete callback, but cannot authorize successful media completion.
 TU_ATTR_WEAK void tud_msc_scsi_complete_cb(uint8_t lun, uint8_t const scsi_cmd[16]);
 
 // Invoked to check if device is writable as part of SCSI WRITE10

@@ -659,7 +659,12 @@ bool mscd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t event, uint32_t
           break;
 
           default:
-            if ( tud_msc_scsi_complete_cb ) tud_msc_scsi_complete_cb(p_cbw->lun, p_cbw->command);
+            // A failed no-data command can already have called its acceptance
+            // callback before BOT detects an unexpected data stage. Only a
+            // successful status may authorize media completion such as eject.
+            if (p_csw->status == MSC_CSW_STATUS_PASSED && tud_msc_scsi_complete_cb) {
+              tud_msc_scsi_complete_cb(p_cbw->lun, p_cbw->command);
+            }
           break;
         }
 
