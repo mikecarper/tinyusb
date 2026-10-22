@@ -48,6 +48,7 @@ enum
   MSC_STAGE_STATUS,
   MSC_STAGE_STATUS_SENT,
   MSC_STAGE_NEED_RESET,
+  MSC_STAGE_DISCARD,
 };
 
 typedef struct
@@ -261,9 +262,9 @@ TU_ATTR_UNUSED static tu_lookup_table_t const _msc_scsi_cmd_table =
 //--------------------------------------------------------------------+
 // APPLICATION API
 //--------------------------------------------------------------------+
-bool tud_msc_set_sense(uint8_t lun, uint8_t sense_key, uint8_t add_sense_code, uint8_t add_sense_qualifier)
-{
-  (void) lun;
+__attribute__((noinline)) bool tud_msc_set_sense(uint8_t lun, uint8_t sense_key, uint8_t add_sense_code,
+                                                 uint8_t add_sense_qualifier) {
+  (void)lun;
 
   _mscd_itf.sense_key           = sense_key;
   _mscd_itf.add_sense_code      = add_sense_code;
@@ -272,7 +273,7 @@ bool tud_msc_set_sense(uint8_t lun, uint8_t sense_key, uint8_t add_sense_code, u
   return true;
 }
 
-#if CFG_TUD_MSC_DEFERRED_WRITE_RETRY
+  #if CFG_TUD_MSC_DEFERRED_WRITE_RETRY
 bool tud_msc_write10_retry_snapshot(uint32_t* generation)
 {
   TU_VERIFY(generation != NULL, false);
@@ -302,7 +303,7 @@ bool tud_msc_write10_retry(uint32_t generation)
   (void) mscd_xfer_cb(rhport, p_msc->ep_out, XFER_RESULT_SUCCESS, xferred_bytes);
   return true;
 }
-#endif
+  #endif
 
 //--------------------------------------------------------------------+
 // USBD Driver API
@@ -346,18 +347,23 @@ uint16_t mscd_open(uint8_t rhport, tusb_desc_interface_t const * itf_desc, uint1
 
 static void proc_bot_reset(mscd_interface_t* p_msc)
 {
-  p_msc->stage       = MSC_STAGE_CMD;
-  p_msc->total_len   = 0;
-  p_msc->xferred_len = 0;
-#if CFG_TUD_MSC_DEFERRED_WRITE_RETRY
+  // An abandoned OUT data completion must not reuse the previous valid CBW.
+  // The next command transfer replaces this signature with fresh host data.
+  p_msc->cbw.signature = 0;
+  p_msc->stage         = MSC_STAGE_CMD;
+  p_msc->total_len     = 0;
+  p_msc->xferred_len   = 0;
+  #if CFG_TUD_MSC_DEFERRED_WRITE_RETRY
   clear_write10_retry(p_msc);
-#endif
+  #endif
 
   p_msc->sense_key           = 0;
   p_msc->add_sense_code      = 0;
   p_msc->add_sense_qualifier = 0;
 
-  if (tud_msc_reset_cb) tud_msc_reset_cb();
+  if (tud_msc_reset_cb) {
+    tud_msc_reset_cb();
+  }
 }
 
 // Invoked when a control transfer occurred on an interface of this class
@@ -514,26 +520,25 @@ bool mscd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t event, uint32_t
           // no data transfer, only exist in complaint test suite
           p_msc->stage = MSC_STAGE_STATUS;
         }
-      }
-      else
-      {
+      } else {
         // For other SCSI commands
         // 1. OUT : queue transfer (invoke app callback after done)
         // 2. IN & Zero: Process if is built-in, else Invoke app callback. Skip DATA if zero length
-        if ( (p_cbw->total_bytes > 0 ) && !is_data_in(p_cbw->dir) )
-        {
-          if (p_cbw->total_bytes > sizeof(_mscd_buf))
-          {
-            TU_LOG(MSC_DEBUG, "  SCSI reject non READ10/WRITE10 with large data\r\n");
-            fail_scsi_op(rhport, p_msc, MSC_CSW_STATUS_FAILED);
-          }else
-          {
+        if ((p_cbw->total_bytes > 0) && !is_data_in(p_cbw->dir)) {
+          if (p_cbw->total_bytes > sizeof(_mscd_buf)) {
+            // BOT 6.7.3 permits accepting all host OUT data instead of
+            // stalling it. Discard bounded chunks without invoking SCSI or
+            // media callbacks; none of these bytes count as processed.
+            p_csw->status = MSC_CSW_STATUS_FAILED;
+            if (p_msc->sense_key == 0) tud_msc_set_sense(p_cbw->lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0x00);
+            p_msc->stage = MSC_STAGE_DISCARD;
+            TU_ASSERT(usbd_edpt_xfer(rhport, p_msc->ep_out, _mscd_buf, sizeof(_mscd_buf)));
+          } else {
             // Didn't check for case 9 (Ho > Dn), which requires examining scsi command first
             // but it is OK to just receive data then responded with failed status
             TU_ASSERT( usbd_edpt_xfer(rhport, p_msc->ep_out, _mscd_buf, p_msc->total_len) );
           }
-        }else
-        {
+        } else {
           // First process if it is a built-in commands
           int32_t resplen = proc_builtin_scsi(p_cbw->lun, p_cbw->command, _mscd_buf, sizeof(_mscd_buf));
 
@@ -634,9 +639,27 @@ bool mscd_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t event, uint32_t
       }
     break;
 
+    case MSC_STAGE_DISCARD:
+      // total_len is the remaining transport data; xferred_len stays zero so
+      // the CSW reports the full amount that was discarded, not processed.
+      if (ep_addr != p_msc->ep_out || event != XFER_RESULT_SUCCESS ||
+          xferred_bytes != tu_min32(p_msc->total_len, sizeof(_mscd_buf))) {
+        p_msc->stage = MSC_STAGE_NEED_RESET;
+        usbd_edpt_stall(rhport, p_msc->ep_in);
+        usbd_edpt_stall(rhport, p_msc->ep_out);
+        return false;
+      }
+      p_msc->total_len -= xferred_bytes;
+      if (p_msc->total_len) {
+        TU_ASSERT(usbd_edpt_xfer(rhport, p_msc->ep_out, _mscd_buf, tu_min32(p_msc->total_len, sizeof(_mscd_buf))));
+      } else {
+        p_msc->stage = MSC_STAGE_STATUS;
+      }
+      break;
+
     case MSC_STAGE_STATUS:
       // processed immediately after this switch, supposedly to be empty
-    break;
+      break;
 
     case MSC_STAGE_STATUS_SENT:
       // Wait for the Status phase to complete

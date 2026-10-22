@@ -79,10 +79,41 @@ static_assert(offsetof(MockUSBD, EVENTS_EPDATA) - offsetof(MockUSBD, EVENTS_USBR
 static Register errata_register;
 static bool anomaly = true, hardware_dma_busy = false, irq_enabled = true;
 static uint32_t primask, barriers, setup_reads_while_busy;
+static std::vector<unsigned> setup_read_order;
+struct SetupScan {
+  uint32_t operator[](unsigned index) const {
+    Register *const registers[] = {&usbd.BMREQUESTTYPE, &usbd.BREQUEST, &usbd.WVALUEL,  &usbd.WVALUEH,
+                                   &usbd.WINDEXL,       &usbd.WINDEXH,  &usbd.WLENGTHL, &usbd.WLENGTHH};
+    assert(index < 8);
+    setup_read_order.push_back(index);
+    return uint32_t(*registers[index]);
+  }
+};
+struct MmioOperation {
+  bool     write;
+  uint32_t address, value;
+};
+static std::vector<MmioOperation> mmio_operations;
+struct MmioRegister {
+  uint32_t address = 0, value = 0;
+  operator uint32_t() const {
+    mmio_operations.push_back(MmioOperation{false, address, value});
+    return value;
+  }
+  void operator=(uint32_t data) {
+    mmio_operations.push_back(MmioOperation{true, address, data});
+    value = data;
+  }
+};
+static MmioRegister errata_unlock, errata_171, errata_187;
+static bool         anomaly_171, anomaly_187;
 static unsigned setup_events, transfer_events, unplugged_events, sof_events;
 static std::vector<int> delivered_events;
 static uint8_t last_setup[8], last_endpoint;
+static uint8_t                             last_setup_tag;
+static bool                                auto_admit_setup;
 static uint32_t last_length;
+static bool                                last_completion_in_isr;
 static std::function<void()> on_barrier;
 static std::function<void(uint32_t, bool)> on_latch_write;
 static std::function<void(uint32_t)> on_pending_read;
@@ -126,6 +157,9 @@ static void NVIC_EnableIRQ(int) { irq_enabled = true; }
 static void NVIC_DisableIRQ(int) { irq_enabled = false; }
 static void NVIC_ClearPendingIRQ(int) {}
 void NVIC_SetPendingIRQ(int) {}
+uint32_t        __get_IPSR() {
+  return scb.ICSR & SCB_ICSR_VECTACTIVE_Msk;
+}
 uint32_t __get_PRIMASK() { return primask; }
 void __disable_irq() { primask = 1; }
 void __set_PRIMASK(uint32_t value) { primask = value; if (!value && on_irq_restore) on_irq_restore(); }
@@ -135,8 +169,8 @@ static void __ISB() { ++barriers; if (on_barrier) on_barrier(); }
 static void __DSB() { ++barriers; if (on_barrier) on_barrier(); }
 bool nrfx_usbd_errata_199() { return NRFX_USBD_ERRATA_ENABLE && anomaly; }
 static bool nrfx_usbd_errata_166() { return false; }
-static bool nrfx_usbd_errata_171() { return false; }
-static bool nrfx_usbd_errata_187() { return false; }
+static bool nrfx_usbd_errata_171() { return NRFX_USBD_ERRATA_ENABLE && anomaly_171; }
+static bool nrfx_usbd_errata_187() { return NRFX_USBD_ERRATA_ENABLE && anomaly_187; }
 enum {
   USBD_IRQn = 39,
   USBD_INTEN_ENDEPIN0_Pos = 2, USBD_INTEN_ENDEPOUT0_Pos = 12, USBD_INTEN_EPDATA_Pos = 24,
@@ -186,6 +220,9 @@ void dcd_event_handler(dcd_event_t const *event, bool) {
   if (event->event_id == DCD_EVENT_SETUP_RECEIVED) {
     ++setup_events; delivered_events.push_back(-1);
     memcpy(last_setup, &event->setup_received, 8);
+#if DCD_TEST_HEADER_SETUP_TAGS
+    last_setup_tag = event->setup_tagid;
+#endif
   }
   if (event->event_id == DCD_EVENT_UNPLUGGED) ++unplugged_events;
 }
@@ -195,11 +232,21 @@ void dcd_event_bus_signal(uint8_t, dcd_eventid_t event, bool) {
 }
 void dcd_event_bus_reset(uint8_t, tusb_speed_t, bool) {}
 void dcd_event_setup_received(uint8_t, uint8_t const *setup, bool) {
-  ++setup_events; delivered_events.push_back(-1); memcpy(last_setup, setup, 8);
+  ++setup_events;
+  delivered_events.push_back(-1);
+  memcpy(last_setup, setup, 8);
+  last_setup_tag = 0;
 }
-void dcd_event_xfer_complete(uint8_t, uint8_t endpoint, uint32_t length, uint8_t result, bool) {
+void dcd_event_setup_received_tagid(uint8_t, const uint8_t *setup, uint8_t tag, bool) {
+  ++setup_events;
+  delivered_events.push_back(-1);
+  memcpy(last_setup, setup, 8);
+  last_setup_tag = tag;
+}
+void dcd_event_xfer_complete(uint8_t, uint8_t endpoint, uint32_t length, uint8_t result, bool in_isr) {
   assert(result == XFER_RESULT_SUCCESS);
   ++transfer_events; delivered_events.push_back(endpoint); last_endpoint = endpoint; last_length = length;
+  last_completion_in_isr                                                                         = in_isr;
 }
 void usbd_defer_func(osal_task_func_t function, void *parameter, bool) {
   deferred.push_back(Deferred{function, parameter});
@@ -211,6 +258,15 @@ static void hfclk_disable() {}
 
 /* DRIVER_FUNCTIONS */
 
+static bool admit_setup(uint8_t tag) {
+#if DCD_TEST_DRIVER_SETUP_TAGS
+  return dcd_edpt0_setup_begin(0, tag);
+#else
+  // A legacy DCD has no admission hook: the real core accepts its SETUPs.
+  (void)tag;
+  return true;
+#endif
+}
 static void reset() {
   on_barrier = {};
   on_task_trigger = {};
@@ -226,14 +282,27 @@ static void reset() {
   for (Register *reg: {&usbd.BMREQUESTTYPE, &usbd.BREQUEST, &usbd.WVALUEL, &usbd.WVALUEH,
                        &usbd.WINDEXL, &usbd.WINDEXH, &usbd.WLENGTHL, &usbd.WLENGTHH}) reg->kind = SETUP;
   memset(&_dcd, 0, sizeof(_dcd));
+#if DCD_TEST_DRIVER_SETUP_TAGS
+  memset(&_ep0, 0, sizeof(_ep0));
+#endif
   _dcd.xfer[0][TUSB_DIR_IN].mps = _dcd.xfer[0][TUSB_DIR_OUT].mps = MAX_PACKET_SIZE;
   scb.ICSR = 0;
   anomaly = irq_enabled = true; hardware_dma_busy = false;
+  anomaly_171 = anomaly_187 = false;
+  errata_unlock.address = 0x4006ec00;
+  errata_171.address = 0x4006ec14;
+  errata_187.address = 0x4006ed14;
+  errata_unlock.value = errata_171.value = errata_187.value = 0;
+  mmio_operations.clear();
+  setup_read_order.clear();
   usbd.ENABLE = 1;
   primask = barriers = setup_reads_while_busy = 0;
   event_reads = 0;
   setup_events = transfer_events = unplugged_events = sof_events = 0;
   last_endpoint = 0; last_length = 0;
+  last_completion_in_isr         = false;
+  last_setup_tag                 = 0;
+  auto_admit_setup               = true;
   memset(last_setup, 0, sizeof(last_setup));
   latch_writes.clear();
   delivered_events.clear();
@@ -247,10 +316,38 @@ static void setup_in() {
   usbd.EVENTS_EP0SETUP = 1;
   usbd.INTEN |= USBD_INTEN_EP0SETUP_Msk;
 }
+static void setup_clear_out() {
+  usbd.BMREQUESTTYPE.value = 0x02;
+  usbd.BREQUEST.value      = TUSB_REQ_CLEAR_FEATURE;
+  usbd.WVALUEL.value = usbd.WVALUEH.value = 0;
+  usbd.WINDEXL.value                      = 3;
+  usbd.WINDEXH.value                      = 0;
+  usbd.WLENGTHL.value = usbd.WLENGTHH.value = 0;
+  usbd.EVENTS_EP0SETUP                      = 1;
+  usbd.INTEN |= USBD_INTEN_EP0SETUP_Msk;
+}
 static void interrupt() {
+  const unsigned setups_before = setup_events;
   scb.ICSR = 16 + USBD_IRQn;
   dcd_int_handler(0);
   scb.ICSR = 0;
+  // The ordinary fixture models usbd processing the delivered SETUP after
+  // ISR return. Stale-work cases explicitly control admission themselves.
+  if (auto_admit_setup && setup_events != setups_before) {
+    assert(admit_setup(last_setup_tag));
+  }
+}
+static unsigned control_tasks() {
+  return usbd.TASKS_EP0STATUS.triggers + usbd.TASKS_EP0RCVOUT.triggers + usbd.TASKS_EP0STALL.triggers +
+         usbd.TASKS_STARTEPIN[0].triggers + usbd.TASKS_STARTEPOUT[0].triggers;
+}
+static void fresh_control_status() {
+  assert(admit_setup(last_setup_tag));
+  const unsigned before    = usbd.TASKS_EP0STATUS.triggers;
+  const unsigned completed = transfer_events;
+  assert(dcd_edpt_xfer(0, 0x80, nullptr, 0));
+  assert(usbd.TASKS_EP0STATUS.triggers == before + 1);
+  assert(transfer_events == completed + 1 && last_endpoint == 0x80 && last_length == 0);
 }
 static void run_deferred_once() {
   size_t const pending = deferred.size();
@@ -279,6 +376,110 @@ static void complete_in_dma(uint8_t endpoint) {
 }
 int main(int argc, char **argv) {
   assert(argc == 2);
+  if (!strcmp(argv[1], "factored-setup-order")) {
+    const uint8_t expected[8] = {0x80, TUSB_REQ_GET_DESCRIPTOR, 0x53, 0x17, 0x29, 0x42, 0x12, 0};
+    for (unsigned busy = 0; busy < 3; busy++) {
+      reset();
+      Register *const registers[] = {&usbd.BMREQUESTTYPE, &usbd.BREQUEST, &usbd.WVALUEL,  &usbd.WVALUEH,
+                                     &usbd.WINDEXL,       &usbd.WINDEXH,  &usbd.WLENGTHL, &usbd.WLENGTHH};
+      for (unsigned i = 0; i < 8; i++) {
+        registers[i]->value = (0xe1a50000u + (i << 8)) | expected[i];
+      }
+      if (busy) {
+        begin_in(1);
+        hardware_dma_busy = true;
+      }
+      usbd.EVENTS_EP0SETUP = 1;
+      usbd.INTEN |= USBD_INTEN_EP0SETUP_Msk;
+      bool injected = false;
+      if (busy == 2) {
+        on_event_read = [&](uint32_t *) {
+          if (!injected && !usbd.EVENTS_EP0SETUP) {
+            injected               = true;
+            usbd.EVENTS_ENDEPIN[1] = 1;
+            hardware_dma_busy      = false;
+          }
+        };
+      }
+      interrupt();
+      assert(setup_reads_while_busy == 0);
+      if (busy == 1) {
+        assert(setup_events == 0 && setup_read_order.empty());
+      } else {
+        assert(setup_events == 1 && setup_read_order.size() == 8);
+        for (unsigned i = 0; i < 8; i++) {
+          assert(setup_read_order[i] == i);
+        }
+        assert(!memcmp(last_setup, expected, sizeof(expected)));
+        if (busy == 2) {
+          assert(injected);
+        }
+      }
+    }
+    return 0;
+  }
+  if (!strcmp(argv[1], "factored-errata-write")) {
+    for (unsigned target = 0; target < 2; target++) {
+      for (unsigned locked = 0; locked < 2; locked++) {
+        reset();
+        errata_unlock.value       = locked ? 0x12345678u : 0;
+        MmioRegister *const reg   = target ? &errata_187 : &errata_171;
+        const uint32_t      value = target ? 3 : 0xc0;
+        usbd_errata_write(reg, value);
+        assert(mmio_operations.size() == (locked ? 2u : 4u));
+        assert(!mmio_operations[0].write && mmio_operations[0].address == 0x4006ec00);
+        assert(mmio_operations[0].value == (locked ? 0x12345678u : 0));
+        const unsigned at = locked ? 1 : 2;
+        assert(mmio_operations[at].write && mmio_operations[at].address == reg->address &&
+               mmio_operations[at].value == value);
+        if (!locked) {
+          assert(mmio_operations[1].write && mmio_operations[1].address == 0x4006ec00 &&
+                 mmio_operations[1].value == 0x9375);
+          assert(mmio_operations[3].write && mmio_operations[3].address == 0x4006ec00 &&
+                 mmio_operations[3].value == 0x9375);
+        }
+      }
+    }
+    reset();
+    anomaly_171 = anomaly_187 = true;
+    usbd.ENABLE               = 0;
+    tusb_hal_nrf_power_event(0);
+    assert(usbd.ENABLE && errata_187.value == 3 && errata_171.value == 0xc0);
+    assert(mmio_operations.size() == 6);
+    assert(mmio_operations[2].address == 0x4006ed14 && mmio_operations[2].value == 3);
+    assert(mmio_operations[5].address == 0x4006ec14 && mmio_operations[5].value == 0xc0);
+    mmio_operations.clear();
+    errata_unlock.value   = 0;
+    usbd.EVENTCAUSE.value = USBD_EVENTCAUSE_READY_Msk;
+    tusb_hal_nrf_power_event(2);
+    assert(usbd.USBPULLUP && !errata_171.value && !errata_187.value);
+    assert(mmio_operations.size() == 6);
+    assert(mmio_operations[2].address == 0x4006ec14 && mmio_operations[2].value == 0);
+    assert(mmio_operations[5].address == 0x4006ed14 && mmio_operations[5].value == 0);
+    unsigned reads = 0;
+    for (const MmioOperation &operation: mmio_operations) {
+      if (!operation.write) {
+        reads++;
+      }
+    }
+    assert(reads == 2);
+    return 0;
+  }
+  if (!strcmp(argv[1], "factored-irq")) {
+    for (unsigned enabled = 0; enabled <= 1; enabled++) {
+      reset();
+      irq_enabled       = enabled;
+      const bool before = dcd_int_save();
+      assert(before == bool(enabled) && !irq_enabled);
+      dcd_int_restore(before);
+      assert(irq_enabled == bool(enabled));
+      (void)dcd_int_save();
+      usbd.ENABLE = 0;
+      dcd_int_restore(true);
+      assert(!irq_enabled);
+    }
+    return 0;
+  }
   if (!strcmp(argv[1], "identity")) {
     for (bool affected: {false, true}) {
       reset(); anomaly = affected;
@@ -450,10 +651,278 @@ int main(int argc, char **argv) {
     usbd.EVENTS_ENDEPOUT[0] = usbd.EVENTS_EP0DATADONE = 1;
     usbd.INTEN |= USBD_INTEN_ENDEPOUT0_Msk;
     interrupt();
-    // This inherited 0.12 event order is recorded as a diagnostic, not fixed by
-    // the DMA ownership backport. The core has no EP0 request generation tag.
-    assert((delivered_events == std::vector<int>{-1, 0, 0x80}));
+    // A co-captured old OUT completion belongs to the superseded request.
+    // Delivering it after SETUP would account old data against the new one.
+    assert((delivered_events == std::vector<int>{-1}));
     assert(!_dcd.dma_running && !errata_register.value);
+    return 0;
+  }
+  if (!strcmp(argv[1], "setup-old-ep0-in")) {
+    reset();
+    setup_in();
+    interrupt();
+    uint8_t old_buffer[2] = {};
+    assert(dcd_edpt_xfer(0, 0x80, old_buffer, sizeof(old_buffer)));
+    assert(usbd.TASKS_STARTEPIN[0].triggers == 1);
+    delivered_events.clear();
+    usbd.EPIN[0].AMOUNT = sizeof(old_buffer);
+    setup_clear_out();
+    usbd.EVENTS_ENDEPIN[0] = usbd.EVENTS_EP0DATADONE = 1;
+    usbd.INTEN |= USBD_INTEN_ENDEPIN0_Msk | USBD_INTEN_EP0DATADONE_Msk;
+    interrupt();
+    assert((delivered_events == std::vector<int>{-1}));
+    assert(transfer_events == 0 && !_dcd.dma_running && !errata_register.value);
+    assert(_dcd.xfer[0][TUSB_DIR_OUT].data_received == 0);
+    fresh_control_status();
+    return 0;
+  }
+  if (!strcmp(argv[1], "setup-stale-admission")) {
+    reset();
+    auto_admit_setup = false;
+    setup_in();
+    interrupt();
+    const uint8_t old_tag = last_setup_tag;
+    setup_clear_out();
+    interrupt();
+    assert(!admit_setup(old_tag));
+    assert(control_tasks() == 0 && transfer_events == 0);
+    fresh_control_status();
+    return 0;
+  }
+  if (!strcmp(argv[1], "setup-stale-status") || !strcmp(argv[1], "setup-stale-data-in") ||
+      !strcmp(argv[1], "setup-stale-data-out") || !strcmp(argv[1], "setup-stale-stall")) {
+    for (uint8_t stale_stall_endpoint: {uint8_t(0), uint8_t(0x80)}) {
+      reset();
+      auto_admit_setup = false;
+      setup_in();
+      interrupt();
+      assert(admit_setup(last_setup_tag));
+      setup_clear_out();
+      interrupt();
+      uint8_t old_buffer[2] = {};
+      if (!strcmp(argv[1], "setup-stale-stall")) {
+        dcd_edpt_stall(0, stale_stall_endpoint);
+      } else if (!strcmp(argv[1], "setup-stale-status")) {
+        (void)dcd_edpt_xfer(0, 0, nullptr, 0);
+      } else {
+        (void)dcd_edpt_xfer(0, !strcmp(argv[1], "setup-stale-data-in") ? 0x80 : 0, old_buffer, sizeof(old_buffer));
+      }
+      // The old task callback runs after the ISR received a new SETUP, but
+      // before usbd admits the new request. It must not touch the controller.
+      assert(control_tasks() == 0 && transfer_events == 0 && !_dcd.dma_running);
+      assert(uint32_t(_dcd.dma_pending) == 0);
+      fresh_control_status();
+    }
+    return 0;
+  }
+  if (!strcmp(argv[1], "setup-status-deferred")) {
+    reset();
+    setup_in();
+    interrupt();
+    begin_in(1); // A bulk DMA owns the shared engine when status is requested.
+    assert(dcd_edpt_xfer(0, 0, nullptr, 0));
+    assert(usbd.TASKS_EP0STATUS.triggers == 0 && transfer_events == 0);
+    on_task_trigger = []() { assert(transfer_events == 0); };
+    complete_in_dma(1);
+    assert(usbd.TASKS_EP0STATUS.triggers == 1);
+    assert(transfer_events == 1 && last_endpoint == 0 && last_length == 0);
+    assert(last_completion_in_isr);
+    return 0;
+  }
+  if (!strcmp(argv[1], "setup-status-before-next-setup")) {
+    reset();
+    setup_in();
+    interrupt();
+    delivered_events.clear();
+    bool injected  = false;
+    on_irq_restore = [&]() {
+      if (!injected && usbd.TASKS_EP0STATUS.triggers) {
+        injected = true;
+        // A SETUP interrupt may run as soon as the task-commit lock opens.
+        setup_clear_out();
+        interrupt();
+      }
+    };
+    assert(dcd_edpt_xfer(0, 0, nullptr, 0));
+    assert(injected);
+    // Posting completion after unlocking reverses these events: usbd would
+    // apply the old status completion to its newly admitted request.
+    assert((delivered_events == std::vector<int>{0, -1}));
+    assert(transfer_events == 1 && setup_events == 2);
+    assert(!last_completion_in_isr);
+    return 0;
+  }
+  if (!strcmp(argv[1], "setup-status-cancel")) {
+    reset();
+    setup_in();
+    interrupt();
+    begin_in(1);
+    assert(dcd_edpt_xfer(0, 0, nullptr, 0));
+    assert(usbd.TASKS_EP0STATUS.triggers == 0 && transfer_events == 0);
+    setup_clear_out();
+    usbd.EVENTS_ENDEPIN[1] = 1;
+    usbd.INTEN |= 1u << (USBD_INTEN_ENDEPIN0_Pos + 1);
+    interrupt();
+    assert(usbd.TASKS_EP0STATUS.triggers == 0 && transfer_events == 0);
+    assert(uint32_t(_dcd.dma_pending) == 0 && !_dcd.dma_running);
+    fresh_control_status();
+    return 0;
+  }
+  if (!strcmp(argv[1], "setup-raw-pending")) {
+    reset();
+    setup_in();
+    interrupt();
+    const uint8_t old_tag = last_setup_tag;
+    setup_clear_out(); // The hardware latched SETUP, but its ISR has not run.
+    uint8_t old_buffer[2] = {};
+    (void)dcd_edpt_xfer(0, 0x80, old_buffer, sizeof(old_buffer));
+    dcd_edpt_stall(0, 0);
+    assert(!admit_setup(old_tag));
+    assert(control_tasks() == 0 && transfer_events == 0 && !_dcd.dma_running);
+    interrupt();
+    fresh_control_status();
+    return 0;
+  }
+  if (!strcmp(argv[1], "setup-timeout-generation")) {
+    reset();
+    auto_admit_setup = false;
+    setup_in();
+    interrupt();
+    const uint8_t old_tag = last_setup_tag;
+    assert(admit_setup(old_tag));
+    begin_out(2);
+    hardware_dma_busy = true;
+    setup_clear_out();
+    interrupt();
+    // Unreadable SETUP registers still mean that the previous request was
+    // superseded. Clearing the event before timing out must not revive it.
+    assert(setup_events == 1 && setup_reads_while_busy == 0);
+    assert(!usbd.EVENTS_EP0SETUP && !admit_setup(old_tag));
+    uint8_t old_buffer[2] = {};
+    (void)dcd_edpt_xfer(0, 0, nullptr, 0);
+    (void)dcd_edpt_xfer(0, 0x80, old_buffer, sizeof(old_buffer));
+    (void)dcd_edpt_xfer(0, 0, old_buffer, sizeof(old_buffer));
+    dcd_edpt_stall(0, 0);
+    dcd_edpt_stall(0, 0x80);
+    assert(control_tasks() == 0 && transfer_events == 0);
+    assert(_dcd.dma_running && errata_register.value == 0x82);
+    hardware_dma_busy       = false;
+    usbd.EPOUT[2].AMOUNT    = 64;
+    usbd.EVENTS_ENDEPOUT[2] = 1;
+    usbd.INTEN |= 1u << (USBD_INTEN_ENDEPOUT0_Pos + 2);
+    interrupt();
+    assert(!_dcd.dma_running && !errata_register.value);
+    setup_clear_out();
+    interrupt();
+    fresh_control_status();
+    return 0;
+  }
+  if (!strcmp(argv[1], "setup-no-data-in-status")) {
+    reset();
+    setup_in();
+    usbd.WLENGTHL.value = 0;
+    interrupt();
+    // A zero-length IN request has an IN status stage, rather than a data ZLP.
+    assert(dcd_edpt_xfer(0, 0x80, nullptr, 0));
+    assert(usbd.TASKS_EP0STATUS.triggers == 1 && usbd.TASKS_STARTEPIN[0].triggers == 0);
+    assert(transfer_events == 1 && last_endpoint == 0x80 && last_length == 0);
+    return 0;
+  }
+  if (!strcmp(argv[1], "setup-stall-during-retirement")) {
+    reset();
+    setup_in();
+    interrupt();
+    uint8_t old_buffer[2] = {};
+    assert(dcd_edpt_xfer(0, 0x80, old_buffer, sizeof(old_buffer)));
+    hardware_dma_busy = true;
+    bool injected     = false;
+    on_event_read     = [&](uint32_t *event) {
+      if (!injected && event == &usbd.EVENTS_ENDEPIN[0]) {
+        injected = true;
+        // SETUP latches while USBD IRQ is masked for bounded retirement.
+        setup_clear_out();
+        hardware_dma_busy      = false;
+        usbd.EVENTS_ENDEPIN[0] = 1;
+      }
+    };
+    dcd_edpt_stall(0, 0);
+    on_event_read = {};
+    assert(injected && usbd.EVENTS_EP0SETUP);
+    assert(usbd.TASKS_EP0STALL.triggers == 0 && transfer_events == 0);
+    assert(!_dcd.dma_running && !errata_register.value);
+    interrupt();
+    fresh_control_status();
+    return 0;
+  }
+  if (!strcmp(argv[1], "setup-unrelated-pending")) {
+    reset();
+    setup_in();
+    interrupt();
+    begin_in(1);
+    begin_out(2);
+    assert(dcd_edpt_xfer(0, 0, nullptr, 0));
+    setup_clear_out();
+    usbd.EVENTS_ENDEPIN[1] = 1;
+    usbd.INTEN |= 1u << (USBD_INTEN_ENDEPIN0_Pos + 1);
+    interrupt();
+    assert(usbd.TASKS_EP0STATUS.triggers == 0 && transfer_events == 0);
+    assert(usbd.TASKS_STARTEPOUT[2].triggers == 1 && _dcd.dma_running);
+    usbd.EPOUT[2].AMOUNT    = 64;
+    usbd.EVENTS_ENDEPOUT[2] = 1;
+    usbd.INTEN |= 1u << (USBD_INTEN_ENDEPOUT0_Pos + 2);
+    interrupt();
+    assert(transfer_events == 1 && last_endpoint == 2 && last_length == 64);
+    fresh_control_status();
+    return 0;
+  }
+  if (!strcmp(argv[1], "setup-address-generation")) {
+    reset();
+    auto_admit_setup = false;
+    setup_in();
+    interrupt();
+    const uint8_t old_tag = last_setup_tag;
+    assert(admit_setup(old_tag));
+    setup_clear_out();
+    usbd.BMREQUESTTYPE.value = 0;
+    usbd.BREQUEST.value      = TUSB_REQ_SET_ADDRESS;
+    usbd.WVALUEL.value       = 7;
+    interrupt();
+    assert(setup_events == 1); // Hardware handles SET_ADDRESS without a core event.
+    assert(!admit_setup(old_tag));
+    dcd_edpt_stall(0, 0);
+    assert(control_tasks() == 0 && transfer_events == 0);
+    setup_clear_out();
+    interrupt();
+    fresh_control_status();
+    return 0;
+  }
+  if (!strcmp(argv[1], "setup-reset-generation")) {
+    for (unsigned boundary: {0u, 1u, 2u}) {
+      reset();
+      auto_admit_setup = false;
+      setup_in();
+      interrupt();
+      const uint8_t old_tag = last_setup_tag;
+      assert(admit_setup(old_tag));
+      if (boundary == 0) {
+        usbd.EVENTS_USBRESET = 1;
+        usbd.INTEN |= USBD_INTEN_USBRESET_Msk;
+        interrupt();
+      } else if (boundary == 1) {
+        dcd_disconnect(0);
+      } else {
+        tusb_hal_nrf_power_event(1);
+      }
+      assert(!admit_setup(old_tag));
+      (void)dcd_edpt_xfer(0, 0, nullptr, 0);
+      dcd_edpt_stall(0, 0);
+      assert(control_tasks() == 0 && transfer_events == 0);
+      // A new transport epoch can subsequently admit and serve fresh SETUP.
+      usbd.ENABLE = 1;
+      setup_clear_out();
+      interrupt();
+      fresh_control_status();
+    }
     return 0;
   }
   if (!strcmp(argv[1], "direction")) {
@@ -815,7 +1284,24 @@ def driver_functions(source):
     if iso_default < 0:
         # Legacy comparison drivers predate the option and always include ISO.
         code = "#ifndef CFG_TUD_NRF5X_ISO\n#define CFG_TUD_NRF5X_ISO 1\n#endif\n" + code
+    code += function(source, "static __attribute__((noinline)) void usbd_errata_write")
     code += function(source, "void tusb_hal_nrf_power_event")
+    # The hardware SETUP window is eight contiguous uint32_t registers. Mock
+    # Register has two words; replace only its indexed address access, retaining
+    # the production loop and byte truncation, and log every actual read.
+    code, setup_seams = re.subn(
+        r"(?:volatile\s+const|const\s+volatile)\s+uint32_t\s*\*\s*setup_regs\s*=\s*&NRF_USBD->BMREQUESTTYPE;",
+        "SetupScan setup_regs;", code)
+    assert setup_seams == 1, "expected one ordered hardware SETUP window"
+    # Execute the actual errata helper through read/write-logging MMIO cells;
+    # only register type/address geometry changes, not unlock control flow.
+    code = code.replace("usbd_errata_write(volatile uint32_t *reg", "usbd_errata_write(MmioRegister *reg")
+    code, latch_seams = re.subn(
+        r"volatile\s+uint32_t\s*\*\s*const\s+latch\s*=\s*\(volatile\s+uint32_t\s*\*\)\s*0x4006EC00;",
+        "MmioRegister *const latch = &errata_unlock;", code)
+    assert latch_seams == 1, "expected one errata unlock register"
+    code = re.sub(r"\(volatile\s+uint32_t\s*\*\)\s*0x4006EC14", "&errata_171", code)
+    code = re.sub(r"\(volatile\s+uint32_t\s*\*\)\s*0x4006ED14", "&errata_187", code)
     code = re.sub(r"^[ \t]*#define NRF_USBD_ERRATA_199_REG.*$",
                   "#define NRF_USBD_ERRATA_199_REG errata_register", code, flags=re.M)
     # The mock EVENT window preserves the raw hardware layout. Its accessor
@@ -835,7 +1321,7 @@ def driver_functions(source):
     code = re.sub(r"volatile\s+uint32_t\s*\*\s*regs;", "Endpoint *regs;", code)
     code = re.sub(r"volatile\s+uint32_t\s*\*\s*task;", "TaskRegister *task;", code)
     code = re.sub(r"(&NRF_USBD->(?:EPIN\[epnum\]|EPOUT\[epnum\]|ISOIN|ISOOUT))\.PTR", r"\1", code)
-    code = code.replace("regs[0] =", "regs->PTR =").replace("regs[1] =", "regs->MAXCNT =")
+    code = code.replace("regs[0]", "regs->PTR").replace("regs[1]", "regs->MAXCNT")
     # Endpoint pointer registers are uintptr_t in the host fixture.
     code = re.sub(r"\(uint32_t\)\s*xfer->buffer", "(uintptr_t)xfer->buffer", code)
     return code
@@ -844,6 +1330,7 @@ def driver_functions(source):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("driver", nargs="?", type=Path, default=DRIVER)
+    parser.add_argument("--source", type=Path, help="Override the production driver for artifact/negative checks")
     parser.add_argument("--errata-enabled", type=int, choices=[0, 1], default=1)
     parser.add_argument("--iso", type=int, choices=[0, 1], help="Override the generic default ISO configuration")
     parser.add_argument("--scenarios", nargs="+", default=[
@@ -852,12 +1339,24 @@ def main():
         "stale-out", "stall-deferred", "stall-inflight", "reset-deferred",
         "fresh-out", "unrelated-pending", "removal-deferred", "close-deferred",
         "close-all", "power-preempts-request", "power-preempts-dispatch", "usb-preempts-removal",
-        "endpoint-bounds", "remote-wakeup-sof"])
+        "endpoint-bounds", "remote-wakeup-sof",
+        "setup-status-deferred", "setup-status-before-next-setup", "setup-status-cancel",
+        "setup-unrelated-pending",
+        "setup-old-ep0", "setup-old-ep0-in", "setup-stale-admission",
+        "setup-stale-status", "setup-stale-data-in", "setup-stale-data-out", "setup-stale-stall",
+        "setup-raw-pending", "setup-timeout-generation", "setup-no-data-in-status",
+        "setup-stall-during-retirement", "setup-address-generation", "setup-reset-generation",
+        "factored-setup-order", "factored-errata-write", "factored-irq"])
     args = parser.parse_args()
+    if args.source is not None:
+        args.driver = args.source
     source = args.driver.read_text()
     with tempfile.TemporaryDirectory(prefix="nrf5x-dma-test-") as directory:
         temp = Path(directory)
         config = f"#define NRFX_USBD_ERRATA_ENABLE {args.errata_enabled}\n"
+        config += f"#define DCD_TEST_DRIVER_SETUP_TAGS {int('dcd_edpt0_setup_begin' in source)}\n"
+        header = (ROOT / "src/device/dcd.h").read_text()
+        config += f"#define DCD_TEST_HEADER_SETUP_TAGS {int('setup_tagid' in header)}\n"
         if args.iso is not None:
             config += f"#define CFG_TUD_NRF5X_ISO {args.iso}\n"
         (temp / "tusb_config.h").write_text(config + CONFIG)

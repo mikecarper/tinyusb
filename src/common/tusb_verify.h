@@ -82,12 +82,15 @@
 #endif
 
 // Halt CPU (breakpoint) when hitting error, only apply for Cortex M3, M4, M7
-#if defined(__ARM_ARCH_7M__) || defined (__ARM_ARCH_7EM__)
-  #define TU_BREAKPOINT() do                                                                                \
-  {                                                                                                         \
-    volatile uint32_t* ARM_CM_DHCSR =  ((volatile uint32_t*) 0xE000EDF0UL); /* Cortex M CoreDebug->DHCSR */ \
-    if ( (*ARM_CM_DHCSR) & 1UL ) __asm("BKPT #0\n"); /* Only halt mcu if debugger is attached */            \
-  } while(0)
+#if defined(__ARM_ARCH_7M__) || defined(__ARM_ARCH_7EM__)
+ // Keep this header self-contained; LTO can fold identical per-TU helpers.
+ TU_ATTR_UNUSED __attribute__((noinline)) static void tu_breakpoint(void) {
+   volatile uint32_t *ARM_CM_DHCSR = (volatile uint32_t *)0xE000EDF0UL;
+   if ((*ARM_CM_DHCSR) & 1UL) {
+     __asm("BKPT #0\n");
+   }
+ }
+  #define TU_BREAKPOINT() tu_breakpoint()
 
 #elif defined(__riscv)
   #define TU_BREAKPOINT() do { __asm("ebreak\n"); } while(0)

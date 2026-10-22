@@ -99,6 +99,18 @@ static struct
   uint32_t dma_pending;
 }_dcd;
 
+// Keep generations across bus_reset() clearing the transfer descriptors.
+static struct {
+  volatile uint8_t received;
+  uint8_t          served;
+  uint8_t          status_ep;
+} _ep0;
+
+
+static bool ep0_superseded(void) {
+  return _ep0.received != _ep0.served || NRF_USBD->EVENTS_EP0SETUP;
+}
+
 void tusb_hal_nrf_power_event(uint32_t event);
 
 // Nordic anomaly 199, matching nrfx's usbd_dma_pending_set/clear(). Only real
@@ -158,7 +170,7 @@ static inline uint32_t NVIC_GetEnableIRQ(IRQn_Type IRQn)
 // check if we are in ISR
 TU_ATTR_ALWAYS_INLINE static inline bool is_in_isr(void)
 {
-  return (SCB->ICSR & SCB_ICSR_VECTACTIVE_Msk) ? true : false;
+  return __get_IPSR() != 0;
 }
 
 static __attribute__((noinline)) void dma_errata_199(uint32_t value) {
@@ -231,7 +243,11 @@ static void dma_dispatch(void) {
     // There are no DMA waits or host callbacks inside this short window.
     const uint32_t saved = __get_PRIMASK();
     __disable_irq();
-    const uint32_t pending = _dcd.dma_pending;
+    uint32_t pending = _dcd.dma_pending;
+    if ((pending & DMA_EP0_MASK) && ep0_superseded()) {
+      pending &= ~DMA_EP0_MASK;
+      _dcd.dma_pending = pending;
+    }
     if (!NRF_USBD->ENABLE || _dcd.dma_active || !pending) {
       __set_PRIMASK(saved);
       return;
@@ -241,6 +257,8 @@ static void dma_dispatch(void) {
     _dcd.dma_pending         = pending & ~bit;
     if (operation == DMA_EP0_STATUS) {
       start_dma(&NRF_USBD->TASKS_EP0STATUS);
+      // Queue only after the hardware task, before a newer SETUP can be queued.
+      dcd_event_xfer_complete(0, _ep0.status_ep, 0, XFER_RESULT_SUCCESS, is_in_isr());
     } else if (operation == DMA_EP0_RCVOUT) {
       start_dma(&NRF_USBD->TASKS_EP0RCVOUT);
     } else {
@@ -322,6 +340,18 @@ void dcd_int_disable(uint8_t rhport)
   NVIC_DisableIRQ(USBD_IRQn);
 }
 
+static __attribute__((noinline)) bool dcd_int_save(void) {
+  const bool enabled = NVIC_GetEnableIRQ(USBD_IRQn);
+  dcd_int_disable(0);
+  return enabled;
+}
+
+static __attribute__((noinline)) void dcd_int_restore(bool enabled) {
+  if (enabled && NRF_USBD->ENABLE) {
+    dcd_int_enable(0);
+  }
+}
+
 void dcd_set_address (uint8_t rhport, uint8_t dev_addr)
 {
   (void) rhport;
@@ -352,6 +382,7 @@ void dcd_disconnect(uint8_t rhport)
 {
   (void) rhport;
   NRF_USBD->USBPULLUP = 0;
+  _ep0.received++;
 
   // Disable Pull-up does not trigger Power USB Removed, in fact it have no
   // impact on the USB Power status at all -> need to submit unplugged event to the stack.
@@ -447,9 +478,9 @@ bool dcd_edpt_open (uint8_t rhport, tusb_desc_endpoint_t const * desc_edpt)
 }
 
 void dcd_edpt_close_all(uint8_t rhport) {
+  (void)rhport;
   // Retire every non-control buffer before clearing its descriptor.
-  const bool enabled = NVIC_GetEnableIRQ(USBD_IRQn);
-  dcd_int_disable(rhport);
+  const bool enabled = dcd_int_save();
   if (!dma_retire(DMA_ALL_MASK & ~DMA_EP0_MASK)) {
     return;
   }
@@ -468,9 +499,7 @@ void dcd_edpt_close_all(uint8_t rhport) {
   NRF_USBD->EPOUTEN = 1UL;
   NRF_USBD->EPINEN  = 1UL;
 
-  if (enabled && NRF_USBD->ENABLE) {
-    dcd_int_enable(rhport);
-  }
+  dcd_int_restore(enabled);
 }
 void dcd_edpt_close (uint8_t rhport, uint8_t ep_addr)
 {
@@ -481,8 +510,7 @@ void dcd_edpt_close (uint8_t rhport, uint8_t ep_addr)
 #if !CFG_TUD_NRF5X_ISO
   TU_VERIFY(epnum < EP_CBI_COUNT, );
 #endif
-  bool const enabled = NVIC_GetEnableIRQ(USBD_IRQn);
-  dcd_int_disable(rhport);
+  const bool enabled = dcd_int_save();
   if (!dma_retire(TU_BIT(epnum + (dir == TUSB_DIR_OUT ? DMA_OUT_BASE : DMA_IN_BASE) +
                          (CFG_TUD_NRF5X_ISO && dir == TUSB_DIR_IN && epnum == EP_ISO_NUM)))) return;
 
@@ -528,7 +556,14 @@ void dcd_edpt_close (uint8_t rhport, uint8_t ep_addr)
 #endif
 
   __ISB(); __DSB();
-  if (enabled && NRF_USBD->ENABLE) dcd_int_enable(rhport);
+  dcd_int_restore(enabled);
+}
+
+bool dcd_edpt0_setup_begin(uint8_t rhport, uint8_t setup_tagid) {
+  (void)rhport;
+  dma_cancel(DMA_EP0_MASK);
+  _ep0.served = setup_tagid;
+  return !ep0_superseded();
 }
 
 bool dcd_edpt_xfer (uint8_t rhport, uint8_t ep_addr, uint8_t * buffer, uint16_t total_bytes)
@@ -541,6 +576,10 @@ bool dcd_edpt_xfer (uint8_t rhport, uint8_t ep_addr, uint8_t * buffer, uint16_t 
   TU_VERIFY(epnum < EP_CBI_COUNT, false);
 #endif
 
+  if (epnum == 0 && ep0_superseded()) {
+    return true;
+  }
+
   xfer_td_t* xfer = get_td(epnum, dir);
 
   xfer->buffer     = buffer;
@@ -548,15 +587,13 @@ bool dcd_edpt_xfer (uint8_t rhport, uint8_t ep_addr, uint8_t * buffer, uint16_t 
   xfer->actual_len = 0;
 
   // Control endpoint with zero-length packet and opposite direction to 1st request byte --> status stage
-  bool const control_status = (epnum == 0 && total_bytes == 0 && dir != _dcd.setup_dir);
+  const bool control_status = (epnum == 0 && total_bytes == 0 && ep_addr == _ep0.status_ep);
 
   if ( control_status )
   {
     // Status Phase also requires EasyDMA has to be available as well !!!!
     dma_request(DMA_EP0_STATUS);
 
-    // The nRF doesn't interrupt on status transmit so we queue up a success response.
-    dcd_event_xfer_complete(0, ep_addr, 0, XFER_RESULT_SUCCESS, is_in_isr());
   }
   else if ( dir == TUSB_DIR_OUT )
   {
@@ -590,19 +627,26 @@ bool dcd_edpt_xfer (uint8_t rhport, uint8_t ep_addr, uint8_t * buffer, uint16_t 
 }
 
 void dcd_edpt_stall(uint8_t rhport, uint8_t ep_addr) {
+  (void)rhport;
   const uint8_t epnum = tu_edpt_number(ep_addr);
   const uint8_t dir   = tu_edpt_dir(ep_addr);
 #if !CFG_TUD_NRF5X_ISO
   TU_VERIFY(epnum < EP_CBI_COUNT, );
 #endif
-  bool const enabled = NVIC_GetEnableIRQ(USBD_IRQn);
-  dcd_int_disable(rhport);
+  const bool enabled = dcd_int_save();
 
   if (epnum == 0) {
+    if (ep0_superseded()) {
+      dcd_int_restore(enabled);
+      return;
+    }
     if (!dma_retire(DMA_EP0_MASK)) {
       return;
     }
-    NRF_USBD->TASKS_EP0STALL = 1;
+    // A SETUP can arrive while retirement waits with only USBD IRQ masked.
+    if (!ep0_superseded()) {
+      NRF_USBD->TASKS_EP0STALL = 1;
+    }
   } else if (epnum != EP_ISO_NUM) {
     NRF_USBD->EPSTALL = (USBD_EPSTALL_STALL_Stall << USBD_EPSTALL_STALL_Pos) | ep_addr;
     if (dir == TUSB_DIR_OUT) {
@@ -616,12 +660,11 @@ void dcd_edpt_stall(uint8_t rhport, uint8_t ep_addr) {
   }
   __ISB();
   __DSB();
-  if (enabled && NRF_USBD->ENABLE) {
-    dcd_int_enable(rhport);
-  }
+  dcd_int_restore(enabled);
 }
 
 void dcd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr) {
+  (void)rhport;
   const uint8_t epnum = tu_edpt_number(ep_addr);
   const uint8_t dir   = tu_edpt_dir(ep_addr);
 #if !CFG_TUD_NRF5X_ISO
@@ -631,8 +674,7 @@ void dcd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr) {
     return;
   }
 
-  const bool enabled = NVIC_GetEnableIRQ(USBD_IRQn);
-  dcd_int_disable(rhport);
+  const bool enabled = dcd_int_save();
   NRF_USBD->DTOGGLE = ep_addr;
   NRF_USBD->DTOGGLE = (USBD_DTOGGLE_VALUE_Data0 << USBD_DTOGGLE_VALUE_Pos) | ep_addr;
   if (dir == TUSB_DIR_OUT) {
@@ -643,15 +685,14 @@ void dcd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr) {
   NRF_USBD->EPSTALL = (USBD_EPSTALL_STALL_UnStall << USBD_EPSTALL_STALL_Pos) | ep_addr;
   __ISB();
   __DSB();
-  if (enabled && NRF_USBD->ENABLE) {
-    dcd_int_enable(rhport);
-  }
+  dcd_int_restore(enabled);
 }
 
 /*------------------------------------------------------------------*/
 /* Interrupt Handler
  *------------------------------------------------------------------*/
 static bool bus_reset(uint32_t captured) {
+  _ep0.received++;
   if (!dma_wait_end(captured)) {
     // A reset may abort DMA without an END. Disable the peripheral before
     // releasing its latch/buffers, and report the same boundary as unplug.
@@ -684,7 +725,7 @@ void dcd_int_handler(uint8_t rhport)
   (void) rhport;
 
   uint32_t const inten  = NRF_USBD->INTEN;
-  uint32_t const int_status = usbd_events(inten, true);
+  uint32_t       int_status = usbd_events(inten, true);
 
   if ( int_status & USBD_INTEN_USBRESET_Msk )
   {
@@ -779,28 +820,38 @@ if (NRF_USBD->EPOUTEN & USBD_EPOUTEN_ISOOUT_Msk)
     }
   }
 
-  // Setup tokens are specific to the Control endpoint.
+  if (int_status & _dcd.dma_active) {
+    edpt_dma_end();
+  }
+
+  // Every SETUP aborts the previous control request, even if busy DMA makes
+  // its registers unreadable. Retire the old generation before the bounded wait.
+  if (int_status & USBD_INTEN_EP0SETUP_Msk) {
+    _ep0.received++;
+    dma_cancel(DMA_EP0_MASK);
+    int_status &= ~(USBD_INTEN_EP0DATADONE_Msk | USBD_INTEN_ENDEPOUT0_Msk);
+  }
   // nRF52840 can read zero SETUP registers during an OUT DMA (#4164).
   // On timeout, drop this request rather than deliver a false zero packet.
   if ((int_status & USBD_INTEN_EP0SETUP_Msk) && dma_wait_end(int_status) && NRF_USBD->ENABLE) {
-    const uint8_t setup[8] = {NRF_USBD->BMREQUESTTYPE, NRF_USBD->BREQUEST, NRF_USBD->WVALUEL,  NRF_USBD->WVALUEH,
-                              NRF_USBD->WINDEXL,       NRF_USBD->WINDEXH,  NRF_USBD->WLENGTHL, NRF_USBD->WLENGTHH};
-    dma_cancel(DMA_EP0_MASK);
+    uint8_t                  setup[8];
+    const volatile uint32_t *setup_regs = &NRF_USBD->BMREQUESTTYPE;
+    for (uint8_t i = 0; i < sizeof(setup); i++) {
+      setup[i] = setup_regs[i];
+    }
+    if (!dma_retire(DMA_EP0_MASK)) {
+      return;
+    }
     _dcd.setup_dir = tu_edpt_dir(setup[0]);
+    _ep0.status_ep = ((setup[6] | setup[7]) && _dcd.setup_dir == TUSB_DIR_IN) ? 0 : TUSB_DIR_IN_MASK;
 
     // nrf5x hw auto handle set address, there is no need to inform usb stack
     const tusb_control_request_t *request = (const tusb_control_request_t *)setup;
 
     if (!(TUSB_REQ_RCPT_DEVICE == request->bmRequestType_bit.recipient &&
           TUSB_REQ_TYPE_STANDARD == request->bmRequestType_bit.type && TUSB_REQ_SET_ADDRESS == request->bRequest)) {
-      dcd_event_setup_received(0, setup, true);
+      dcd_event_setup_received_tagid(0, setup, _ep0.received, true);
     }
-  }
-
-  if (int_status & _dcd.dma_active) {
-    // DMA complete move data from SRAM <-> Endpoint
-    // Must before endpoint transfer handling
-    edpt_dma_end();
   }
 
   //--------------------------------------------------------------------+
@@ -1013,6 +1064,19 @@ static void hfclk_disable(void)
   nrf_clock_task_trigger(NRF_CLOCK, NRF_CLOCK_TASK_HFCLKSTOP);
 }
 
+  #ifdef NRF52_SERIES
+static __attribute__((noinline)) void usbd_errata_write(volatile uint32_t *reg, uint32_t value) {
+  volatile uint32_t *const latch = (volatile uint32_t *)0x4006EC00;
+  if (*latch == 0) {
+    *latch = 0x9375;
+    *reg   = value;
+    *latch = 0x9375;
+  } else {
+    *reg = value;
+  }
+}
+  #endif
+
 // Power & Clock Peripheral on nRF5x to manage USB
 //
 // USB Bus power is managed by Power module, there are 3 VBUS power events:
@@ -1052,32 +1116,14 @@ void tusb_hal_nrf_power_event (uint32_t event)
         if ( nrfx_usbd_errata_187() )
         {
           // CRITICAL_REGION_ENTER();
-          if ( *((volatile uint32_t *) (0x4006EC00)) == 0x00000000 )
-          {
-            *((volatile uint32_t *) (0x4006EC00)) = 0x00009375;
-            *((volatile uint32_t *) (0x4006ED14)) = 0x00000003;
-            *((volatile uint32_t *) (0x4006EC00)) = 0x00009375;
-          }
-          else
-          {
-            *((volatile uint32_t *) (0x4006ED14)) = 0x00000003;
-          }
+          usbd_errata_write((volatile uint32_t *)0x4006ED14, 0x00000003);
           // CRITICAL_REGION_EXIT();
         }
 
         if ( nrfx_usbd_errata_171() )
         {
           // CRITICAL_REGION_ENTER();
-          if ( *((volatile uint32_t *) (0x4006EC00)) == 0x00000000 )
-          {
-            *((volatile uint32_t *) (0x4006EC00)) = 0x00009375;
-            *((volatile uint32_t *) (0x4006EC14)) = 0x000000C0;
-            *((volatile uint32_t *) (0x4006EC00)) = 0x00009375;
-          }
-          else
-          {
-            *((volatile uint32_t *) (0x4006EC14)) = 0x000000C0;
-          }
+          usbd_errata_write((volatile uint32_t *)0x4006EC14, 0x000000C0);
           // CRITICAL_REGION_EXIT();
         }
 #endif
@@ -1121,16 +1167,7 @@ void tusb_hal_nrf_power_event (uint32_t event)
       if ( nrfx_usbd_errata_171() )
       {
         // CRITICAL_REGION_ENTER();
-        if ( *((volatile uint32_t *) (0x4006EC00)) == 0x00000000 )
-        {
-          *((volatile uint32_t *) (0x4006EC00)) = 0x00009375;
-          *((volatile uint32_t *) (0x4006EC14)) = 0x00000000;
-          *((volatile uint32_t *) (0x4006EC00)) = 0x00009375;
-        }
-        else
-        {
-          *((volatile uint32_t *) (0x4006EC14)) = 0x00000000;
-        }
+        usbd_errata_write((volatile uint32_t *)0x4006EC14, 0x00000000);
 
         // CRITICAL_REGION_EXIT();
       }
@@ -1138,16 +1175,7 @@ void tusb_hal_nrf_power_event (uint32_t event)
       if ( nrfx_usbd_errata_187() )
       {
         // CRITICAL_REGION_ENTER();
-        if ( *((volatile uint32_t *) (0x4006EC00)) == 0x00000000 )
-        {
-          *((volatile uint32_t *) (0x4006EC00)) = 0x00009375;
-          *((volatile uint32_t *) (0x4006ED14)) = 0x00000000;
-          *((volatile uint32_t *) (0x4006EC00)) = 0x00009375;
-        }
-        else
-        {
-          *((volatile uint32_t *) (0x4006ED14)) = 0x00000000;
-        }
+        usbd_errata_write((volatile uint32_t *)0x4006ED14, 0x00000000);
         // CRITICAL_REGION_EXIT();
       }
 
@@ -1204,6 +1232,7 @@ void tusb_hal_nrf_power_event (uint32_t event)
         __ISB(); __DSB(); // for sync
 
         _dcd.dma_pending = 0;
+        _ep0.received++;
         edpt_dma_end();
 
         hfclk_disable();

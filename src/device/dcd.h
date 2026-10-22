@@ -70,6 +70,7 @@ typedef struct TU_ATTR_ALIGNED(4)
 {
   uint8_t rhport;
   uint8_t event_id;
+  uint8_t setup_tagid;
 
   union
   {
@@ -137,6 +138,9 @@ void dcd_disconnect(uint8_t rhport) TU_ATTR_WEAK;
 // Endpoint API
 //--------------------------------------------------------------------+
 
+// False if this queued SETUP was superseded before the stack started it.
+bool dcd_edpt0_setup_begin(uint8_t rhport, uint8_t setup_tagid) TU_ATTR_WEAK;
+
 // Invoked when a control transfer's status stage is complete.
 // May help DCD to prepare for next control transfer, this API is optional.
 void dcd_edpt0_status_complete(uint8_t rhport, tusb_control_request_t const * request) TU_ATTR_WEAK;
@@ -182,6 +186,7 @@ extern void dcd_event_bus_reset (uint8_t rhport, tusb_speed_t speed, bool in_isr
 
 // helper to send setup received
 extern void dcd_event_setup_received(uint8_t rhport, uint8_t const * setup, bool in_isr);
+extern void dcd_event_setup_received_tagid(uint8_t rhport, const uint8_t *setup, uint8_t setup_tagid, bool in_isr);
 
 // helper to send transfer complete event
 extern void dcd_event_xfer_complete (uint8_t rhport, uint8_t ep_addr, uint32_t xferred_bytes, uint8_t result, bool in_isr);

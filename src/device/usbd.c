@@ -525,6 +525,10 @@ void tud_task (void)
         TU_LOG2_VAR(&event.setup_received);
         TU_LOG2("\r\n");
 
+        if (dcd_edpt0_setup_begin && !dcd_edpt0_setup_begin(event.rhport, event.setup_tagid)) {
+          break;
+        }
+
         // Mark as connected after receiving 1st setup packet.
         // But it is easier to set it every time instead of wasting time to check then set
         _usbd_dev.connected = 1;
@@ -1150,12 +1154,15 @@ void dcd_event_bus_reset (uint8_t rhport, tusb_speed_t speed, bool in_isr)
   dcd_event_handler(&event, in_isr);
 }
 
-void dcd_event_setup_received(uint8_t rhport, uint8_t const * setup, bool in_isr)
-{
-  dcd_event_t event = { .rhport = rhport, .event_id = DCD_EVENT_SETUP_RECEIVED };
+void dcd_event_setup_received_tagid(uint8_t rhport, const uint8_t *setup, uint8_t setup_tagid, bool in_isr) {
+  dcd_event_t event = {.rhport = rhport, .event_id = DCD_EVENT_SETUP_RECEIVED, .setup_tagid = setup_tagid};
   memcpy(&event.setup_received, setup, 8);
 
   dcd_event_handler(&event, in_isr);
+}
+
+void dcd_event_setup_received(uint8_t rhport, const uint8_t *setup, bool in_isr) {
+  dcd_event_setup_received_tagid(rhport, setup, 0, in_isr);
 }
 
 void dcd_event_xfer_complete (uint8_t rhport, uint8_t ep_addr, uint32_t xferred_bytes, uint8_t result, bool in_isr)

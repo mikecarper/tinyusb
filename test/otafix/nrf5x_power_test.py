@@ -70,6 +70,8 @@ static bool tud_inited() { return true; }
 static bool is_in_isr() { return false; }
 // DMA ownership is exercised by nrf5x_dma_test.py; these tests isolate power.
 static struct { uint32_t dma_pending; } _dcd;
+static struct { uint8_t received; } _ep0;
+#define ep0_trace(...) ((void)0)
 static bool dma_wait_end(uint32_t) { return true; }
 static void edpt_dma_end() {}
 static void dcd_event_bus_signal(unsigned, unsigned, bool) { ++unplugged; }
@@ -83,6 +85,7 @@ static void reset() {
   clock_requested = irq_enabled = false;
   clock_reads = clock_delay = clock_requests = ready_reads = unplugged = 0;
   _dcd.dma_pending = 0;
+  _ep0.received = 0;
 }
 static void detected() { tusb_hal_nrf_power_event(0); }
 static void ready() { tusb_hal_nrf_power_event(2); }
