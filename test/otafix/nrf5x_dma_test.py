@@ -23,6 +23,9 @@ CONFIG = r'''
 #define CFG_TUSB_OS OPT_OS_NONE
 #define CFG_TUSB_RHPORT0_MODE (OPT_MODE_DEVICE | OPT_MODE_FULL_SPEED)
 #define CFG_TUSB_DEBUG 0
+#ifndef CFG_TUD_NRF5X_CONTROL_STALL_QUIET
+#define CFG_TUD_NRF5X_CONTROL_STALL_QUIET 0
+#endif
 #ifndef NRFX_USBD_ERRATA_ENABLE
 #define NRFX_USBD_ERRATA_ENABLE 1
 #endif
@@ -41,7 +44,7 @@ HARNESS = r'''
 #include "device/usbd.h"
 #include "device/usbd_pvt.h"
 
-enum RegKind { PLAIN, SETUP, IRQ_SET, IRQ_CLEAR, W1C, ERRATA };
+enum RegKind { PLAIN, SETUP, IRQ_SET, IRQ_CLEAR, W1C, ERRATA, EPSTALL_WRITE, DTOGGLE_WRITE };
 static std::function<void()> on_task_trigger;
 struct Register {
   RegKind kind = PLAIN;
@@ -73,6 +76,9 @@ struct MockUSBD {
   Register BMREQUESTTYPE, BREQUEST, WVALUEL, WVALUEH, WINDEXL, WINDEXH, WLENGTHL, WLENGTHH;
   Endpoint EPIN[9], EPOUT[9], ISOIN, ISOOUT;
   struct { uint32_t EPOUT[9] = {}, ISOOUT = 0; } SIZE;
+  struct {
+    uint32_t EPIN[8] = {}, EPOUT[8] = {};
+  } HALTED;
 } usbd;
 static_assert(offsetof(MockUSBD, EVENTS_EPDATA) - offsetof(MockUSBD, EVENTS_USBRESET) == 24 * 4,
               "mock event layout must match Nordic interrupt positions");
@@ -117,6 +123,9 @@ static bool                                last_completion_in_isr;
 static std::function<void()> on_barrier;
 static std::function<void(uint32_t, bool)> on_latch_write;
 static std::function<void(uint32_t)> on_pending_read;
+static std::function<void(uint32_t)> on_epstall_write;
+static std::function<void(const Register *, uint32_t)> on_register_write;
+static std::function<void()> on_primask_read;
 static std::function<void()> on_irq_restore;
 // This POD preserves the pending word's ordinary C read/modify/write order,
 // while allowing a higher-priority power interrupt between its load/store.
@@ -143,6 +152,7 @@ struct EventScan {
   EventRef operator[](unsigned i) const { return EventRef{base + i}; }
 };
 static std::vector<uint32_t> latch_writes;
+static std::vector<uint32_t> epstall_writes, dtoggle_writes;
 struct Deferred { osal_task_func_t function; void *parameter; };
 static std::vector<Deferred> deferred;
 struct { uint32_t ICSR = 0; } scb;
@@ -160,7 +170,7 @@ void NVIC_SetPendingIRQ(int) {}
 uint32_t        __get_IPSR() {
   return scb.ICSR & SCB_ICSR_VECTACTIVE_Msk;
 }
-uint32_t __get_PRIMASK() { return primask; }
+uint32_t __get_PRIMASK() { if (on_primask_read) on_primask_read(); return primask; }
 void __disable_irq() { primask = 1; }
 void __set_PRIMASK(uint32_t value) { primask = value; if (!value && on_irq_restore) on_irq_restore(); }
 void __enable_irq() { __set_PRIMASK(0); }
@@ -202,12 +212,26 @@ Register::operator uint32_t() const {
   return value;
 }
 void Register::operator=(uint32_t v) {
+  if (on_register_write) on_register_write(this, v);
   if (kind == ERRATA && on_latch_write) on_latch_write(v, false);
   if (kind == IRQ_SET) usbd.INTEN |= v;
   else if (kind == IRQ_CLEAR) usbd.INTEN &= ~v;
   else if (kind == W1C) value &= ~v;
   else {
     value = v;
+    if (kind == EPSTALL_WRITE) {
+      if (on_epstall_write) on_epstall_write(v);
+      const unsigned epnum = v & 0xfu;
+      assert(epnum <= 8);
+      // ISO endpoint8 has no HALTED register; inherited open still writes UnStall.
+      if (epnum < 8) {
+        (v & 0x80u ? usbd.HALTED.EPIN[epnum] : usbd.HALTED.EPOUT[epnum]) = (v >> 8) & 1u;
+      }
+      epstall_writes.push_back(v);
+    }
+    if (kind == DTOGGLE_WRITE) {
+      dtoggle_writes.push_back(v);
+    }
     if (kind == ERRATA) {
       // Aborted DMA may still own the controller until it is disabled.
       if (!v && hardware_dma_busy) assert(!usbd.ENABLE);
@@ -256,6 +280,14 @@ static bool hfclk_running() { return true; }
 static void hfclk_enable() {}
 static void hfclk_disable() {}
 
+static unsigned quiet_delay_calls;
+static std::function<void(uint32_t)> quiet_delay_hook;
+static __attribute__((unused)) void nrf_delay_us(uint32_t us) {
+  assert(!primask);
+  ++quiet_delay_calls;
+  if (quiet_delay_hook) quiet_delay_hook(us);
+}
+
 /* DRIVER_FUNCTIONS */
 
 static bool admit_setup(uint8_t tag) {
@@ -268,10 +300,15 @@ static bool admit_setup(uint8_t tag) {
 #endif
 }
 static void reset() {
+  quiet_delay_calls = 0;
+  quiet_delay_hook = {};
   on_barrier = {};
   on_task_trigger = {};
   on_latch_write = {};
   on_pending_read = {};
+  on_epstall_write = {};
+  on_register_write = {};
+  on_primask_read = {};
   on_irq_restore = {};
   on_event_read = {};
   usbd = MockUSBD{};
@@ -279,6 +316,7 @@ static void reset() {
   errata_register.kind = ERRATA;
   usbd.INTENSET.kind = IRQ_SET; usbd.INTENCLR.kind = IRQ_CLEAR;
   usbd.EVENTCAUSE.kind = W1C; usbd.EPDATASTATUS.kind = W1C;
+  usbd.EPSTALL.kind = EPSTALL_WRITE; usbd.DTOGGLE.kind = DTOGGLE_WRITE;
   for (Register *reg: {&usbd.BMREQUESTTYPE, &usbd.BREQUEST, &usbd.WVALUEL, &usbd.WVALUEH,
                        &usbd.WINDEXL, &usbd.WINDEXH, &usbd.WLENGTHL, &usbd.WLENGTHH}) reg->kind = SETUP;
   memset(&_dcd, 0, sizeof(_dcd));
@@ -305,6 +343,7 @@ static void reset() {
   auto_admit_setup               = true;
   memset(last_setup, 0, sizeof(last_setup));
   latch_writes.clear();
+  epstall_writes.clear(); dtoggle_writes.clear();
   delivered_events.clear();
   deferred.clear();
 }
@@ -374,7 +413,163 @@ static void complete_in_dma(uint8_t endpoint) {
   usbd.INTEN |= 1u << (USBD_INTEN_ENDEPIN0_Pos + endpoint);
   interrupt();
 }
+#if DCD_TEST_DRIVER_SETUP_TAGS
+static void quiet_setup() {
+  reset();
+  _ep0.received = _ep0.served = 9;
+  _ep0.status_ep              = 0;
+  _dcd.setup_dir              = TUSB_DIR_IN;
+}
+static bool quiet_shape_test(const char *name) {
+  if (!strcmp(name, "quiet-status-thread") || !strcmp(name, "quiet-status-isr")) {
+    quiet_setup();
+    const bool in_isr = !strcmp(name, "quiet-status-isr");
+    if (in_isr) {
+      scb.ICSR = 16 + USBD_IRQn;
+    }
+    on_task_trigger  = [&]() { assert(!transfer_events && primask); };
+    quiet_delay_hook = [&](uint32_t us) {
+      assert(us == 2000 && !primask && irq_enabled);
+      assert(usbd.TASKS_EP0STATUS.triggers == 1 && transfer_events == 1);
+      assert(last_completion_in_isr == in_isr);
+    };
+    assert(dcd_edpt_xfer(0, 0, nullptr, 0));
+    if (in_isr) {
+      assert(!quiet_delay_calls);
+      scb.ICSR = 0;
+      interrupt();
+    }
+    assert(quiet_delay_calls == 1 && transfer_events == 1 && !primask && irq_enabled);
+    return true;
+  }
+  if (!strcmp(name, "quiet-stall-cleanup")) {
+    for (unsigned dir = 0; dir < 2; dir++) {
+      quiet_setup();
+      if (dir == 0) {
+        begin_out(3);
+        usbd.EVENTS_ENDEPOUT[3] = 1;
+      } else {
+        begin_in(1);
+        usbd.EVENTS_ENDEPIN[1] = 1;
+      }
+      quiet_delay_hook = [&](uint32_t us) {
+        assert(us == 2000 && !primask && !irq_enabled && epstall_writes.size() == 1);
+        if (!dir) {
+          assert(!_dcd.dma_running && !usbd.EVENTS_ENDEPOUT[3] && !_dcd.xfer[3][0].total_len &&
+                 !_dcd.xfer[3][0].actual_len && _dcd.xfer[3][0].data_received == OUT_HALTED);
+        } else {
+          assert(_dcd.dma_running == TU_BIT(DMA_IN_BASE + 1) && usbd.EVENTS_ENDEPIN[1]);
+        }
+      };
+      dcd_edpt_stall(0, dir ? 0x83 : 3);
+      assert(quiet_delay_calls == 1 && !primask && irq_enabled);
+      if (dir) {
+        usbd.INTEN |= TU_BIT(DMA_IN_BASE + 1);
+        interrupt();
+        assert(!_dcd.dma_running);
+      }
+    }
+    return true;
+  }
+  if (!strcmp(name, "quiet-masked-policy")) {
+    for (unsigned action = 0; action < 3; action++) {
+      quiet_setup();
+      primask = 1;
+      if (!action) {
+        assert(dcd_edpt_xfer(0, 0, nullptr, 0));
+      } else {
+        dcd_edpt_stall(0, action == 1 ? 0x83 : 3);
+      }
+      assert(!quiet_delay_calls && primask == 1 && !usbd.ENABLE && !irq_enabled && unplugged_events == 1);
+      assert(action || usbd.TASKS_EP0STATUS.triggers == 1); // TASK committed before failclosed boundary.
+    }
+    return true;
+  }
+  if (!strcmp(name, "quiet-lifecycle")) {
+    for (unsigned action = 0; action < 3; action++) {
+      quiet_setup();
+      unsigned writes = 0, after = 0;
+      on_register_write = [&](const Register *, uint32_t) { writes++; };
+      quiet_delay_hook  = [&](uint32_t) {
+        assert(!primask);
+        tusb_hal_nrf_power_event(1);
+        usbd.ENABLE = 1;
+        after       = writes;
+      };
+      if (!action) {
+        assert(dcd_edpt_xfer(0, 0, nullptr, 0));
+      } else {
+        dcd_edpt_stall(0, action == 1 ? 0x83 : 3);
+      }
+      assert(quiet_delay_calls == 1 && writes == after && usbd.ENABLE && unplugged_events == 1);
+      assert(_ep0.received == 10 && !primask);
+    }
+    return true;
+  }
+  if (!strcmp(name, "quiet-setup-order")) {
+    quiet_setup();
+    quiet_delay_hook = [&](uint32_t) {
+      assert(transfer_events == 1 && delivered_events.size() == 1 && delivered_events[0] == 0);
+      setup_in();
+      interrupt();
+      assert(setup_events == 1 && _ep0.received == 10 && _ep0.served == 10);
+    };
+    assert(dcd_edpt_xfer(0, 0, nullptr, 0));
+    assert(quiet_delay_calls == 1 && delivered_events.size() == 2);
+    assert(delivered_events[0] == 0 && delivered_events[1] == -1);
+    quiet_setup();
+    quiet_delay_hook = [&](uint32_t) {
+      assert(!irq_enabled);
+      setup_in();
+    };
+    dcd_edpt_stall(0, 0x83);
+    assert(quiet_delay_calls == 1 && irq_enabled && !setup_events);
+    interrupt();
+    assert(setup_events == 1 && _ep0.received == 10);
+    return true;
+  }
+  if (!strcmp(name, "quiet-status-usb-progress")) {
+    quiet_setup();
+    static uint8_t buffer[64];
+    _dcd.xfer[1][TUSB_DIR_OUT].mps = 64;
+    assert(dcd_edpt_xfer(0, 1, buffer, 64));
+    quiet_delay_hook = [&](uint32_t) {
+      assert(!primask && irq_enabled && epstall_writes.empty());
+      usbd.SIZE.EPOUT[1]      = 64;
+      usbd.EPDATASTATUS.value = TU_BIT(17);
+      usbd.EVENTS_EPDATA      = 1;
+      usbd.INTEN |= USBD_INTEN_EPDATA_Msk;
+      interrupt();
+      assert(usbd.TASKS_STARTEPOUT[1].triggers == 1 && _dcd.dma_running == TU_BIT(DMA_OUT_BASE + 1));
+    };
+    assert(dcd_edpt_xfer(0, 0, nullptr, 0));
+    assert(quiet_delay_calls == 1 && usbd.TASKS_STARTEPOUT[1].triggers == 1 && epstall_writes.empty());
+    return true;
+  }
+  if (!strcmp(name, "quiet-unrelated")) {
+    quiet_setup();
+    assert(dcd_edpt_abort(0, 3));
+    dcd_edpt_clear_stall(0, 3);
+    dcd_edpt_stall(0, 0x80);
+    assert(!quiet_delay_calls && usbd.TASKS_EP0STALL.triggers == 1);
+    return true;
+  }
+  if (!strcmp(name, "quiet-optout")) {
+    quiet_setup();
+    dcd_edpt_stall(0, 0x83);
+    assert(!quiet_delay_calls);
+    assert(dcd_edpt_xfer(0, 0, nullptr, 0));
+    assert(!quiet_delay_calls && usbd.TASKS_EP0STATUS.triggers == 1);
+    return true;
+  }
+  return false;
+}
+#endif
+
 int main(int argc, char **argv) {
+#if DCD_TEST_DRIVER_SETUP_TAGS
+  if (argc == 2 && quiet_shape_test(argv[1])) { return 0; }
+#endif
   assert(argc == 2);
   if (!strcmp(argv[1], "factored-setup-order")) {
     const uint8_t expected[8] = {0x80, TUSB_REQ_GET_DESCRIPTOR, 0x53, 0x17, 0x29, 0x42, 0x12, 0};
@@ -945,6 +1140,674 @@ int main(int argc, char **argv) {
   }
   // Regression cases exercise packet, pending-operation and hardware ownership
   // across endpoint halt, rearm, reset and physical removal.
+  if (!strcmp(argv[1], "abort-pending")) {
+    reset();
+    begin_in(2);
+    uint8_t old[128] = {}, sibling[32] = {};
+    auto   *out        = &_dcd.xfer[1][TUSB_DIR_OUT];
+    out->mps           = 64;
+    out->data_received = true;
+    usbd.SIZE.EPOUT[1] = 32;
+    assert(dcd_edpt_xfer(0, 1, old, sizeof(old)));
+    _dcd.xfer[3][TUSB_DIR_IN].mps = 64;
+    assert(dcd_edpt_xfer(0, 0x83, sibling, sizeof(sibling)));
+    const uint32_t owner  = _dcd.dma_running;
+    const uint32_t queued = TU_BIT(DMA_OUT_BASE + 1) | TU_BIT(DMA_IN_BASE + 3);
+    assert(uint32_t(_dcd.dma_pending) == queued);
+    usbd.EPDATASTATUS.value = TU_BIT(17) | TU_BIT(19);
+    usbd.SIZE.EPOUT[3]      = 19;
+    usbd.EVENTS_ENDEPOUT[3] = 1;
+    usbd.EVENTS_ENDEPIN[2] = 1;
+    assert(dcd_edpt_abort(0, 1));
+    assert(_dcd.dma_running == owner && uint32_t(_dcd.dma_pending) == TU_BIT(DMA_IN_BASE + 3));
+    assert(out->buffer == old && out->mps == 64 && !out->total_len && !out->actual_len && !out->data_received);
+    assert(usbd.SIZE.EPOUT[1] == 0 && usbd.SIZE.EPOUT[3] == 19);
+    assert(usbd.EPDATASTATUS.value == TU_BIT(19) && usbd.EVENTS_ENDEPOUT[3] == 1);
+    assert(epstall_writes.empty() && dtoggle_writes.empty() && transfer_events == 0);
+    complete_in_dma(2);
+    assert(usbd.TASKS_STARTEPOUT[1].triggers == 0 && usbd.TASKS_STARTEPIN[3].triggers == 1);
+    assert(usbd.EPIN[3].PTR == (uintptr_t)sibling);
+    return 0;
+  }
+
+  if (!strcmp(argv[1], "abort-sibling-dma")) {
+    for (unsigned owner_ep: {0u, 2u}) {
+      for (unsigned owner_dir = 0; owner_dir < 2; ++owner_dir) {
+        for (const bool enabled: {false, true}) {
+          reset();
+          if (owner_dir == TUSB_DIR_IN) {
+            _dcd.setup_dir = TUSB_DIR_IN;
+            begin_in(owner_ep);
+          } else {
+            begin_out(owner_ep);
+            if (!owner_ep) {
+              usbd.EVENTS_EP0DATADONE = 1;
+              usbd.INTEN |= USBD_INTEN_EP0DATADONE_Msk;
+              interrupt();
+            }
+          }
+          const uint32_t owner = TU_BIT((owner_dir == TUSB_DIR_IN ? DMA_IN_BASE : DMA_OUT_BASE) + owner_ep);
+          assert(_dcd.dma_running == owner);
+          auto      *active  = &_dcd.xfer[owner_ep][owner_dir];
+          const auto before  = *active;
+          uint8_t    old[64] = {}, sibling[32] = {};
+          auto      *out     = &_dcd.xfer[1][TUSB_DIR_OUT];
+          out->mps           = 64;
+          out->data_received = true;
+          usbd.SIZE.EPOUT[1] = sizeof(old);
+          assert(dcd_edpt_xfer(0, 1, old, sizeof(old)));
+          _dcd.xfer[3][TUSB_DIR_IN].mps = 64;
+          assert(dcd_edpt_xfer(0, 0x83, sibling, sizeof(sibling)));
+          assert(uint32_t(_dcd.dma_pending) == (TU_BIT(DMA_OUT_BASE + 1) | TU_BIT(DMA_IN_BASE + 3)));
+          uint32_t *const raw_end =
+            owner_dir == TUSB_DIR_IN ? &usbd.EVENTS_ENDEPIN[owner_ep] : &usbd.EVENTS_ENDEPOUT[owner_ep];
+          usbd.EVENTS_ENDEPOUT[1] = 1; // An unrelated raw END cannot satisfy the global owner wait.
+          usbd.EPDATASTATUS.value = TU_BIT(17) | TU_BIT(19);
+          usbd.SIZE.EPOUT[3]      = 19;
+          hardware_dma_busy       = true;
+          irq_enabled             = enabled;
+          unsigned polls = 0, flushes = 0;
+          on_event_read = [&](uint32_t *) {
+            assert(!primask && !irq_enabled && !flushes);
+            if (++polls == 3) {
+              hardware_dma_busy                                                              = false;
+              *raw_end                                                                       = 1;
+              (owner_dir == TUSB_DIR_IN ? usbd.EPIN[owner_ep] : usbd.EPOUT[owner_ep]).AMOUNT = 64;
+            }
+          };
+          on_register_write = [&](const Register *reg, uint32_t value) {
+            if (reg != &usbd.EPDATASTATUS) {
+              return;
+            }
+            assert(!hardware_dma_busy && *raw_end == 1);
+            assert(primask == 1 && !irq_enabled && usbd.ENABLE && _dcd.dma_running == owner);
+            assert(value == TU_BIT(17) && !usbd.EVENTS_ENDEPOUT[1]);
+            ++flushes;
+          };
+          assert(dcd_edpt_abort(0, 1));
+          on_register_write = {};
+          on_event_read     = {};
+          assert(polls >= 3 && flushes == 1 && irq_enabled == enabled && !primask);
+          assert(*raw_end == 1 && _dcd.dma_running == owner);
+          assert(uint32_t(_dcd.dma_pending) == TU_BIT(DMA_IN_BASE + 3));
+          assert(active->buffer == before.buffer && active->total_len == before.total_len &&
+                 active->actual_len == before.actual_len && active->mps == before.mps &&
+                 active->data_received == before.data_received &&
+                 active->iso_in_transfer_ready == before.iso_in_transfer_ready);
+          assert(out->buffer == old && out->mps == 64 && !out->total_len && !out->actual_len && !out->data_received);
+          assert(!usbd.EVENTS_ENDEPOUT[1] && !usbd.SIZE.EPOUT[1]);
+          assert(usbd.EPDATASTATUS.value == TU_BIT(19) && usbd.SIZE.EPOUT[3] == 19);
+          assert(transfer_events == 0 && epstall_writes.empty() && dtoggle_writes.empty());
+          usbd.INTEN |= owner | TU_BIT(DMA_OUT_BASE + 1);
+          interrupt();
+          assert(*raw_end == 0 && usbd.TASKS_STARTEPIN[3].triggers == 1);
+          assert(usbd.EPIN[3].PTR == (uintptr_t)sibling && usbd.EPIN[3].MAXCNT == sizeof(sibling));
+          if (owner_dir == TUSB_DIR_IN) {
+            if (!owner_ep) {
+              usbd.EVENTS_EP0DATADONE = 1;
+              usbd.INTEN |= USBD_INTEN_EP0DATADONE_Msk;
+            } else {
+              usbd.EPDATASTATUS.value = TU_BIT(owner_ep);
+              usbd.EVENTS_EPDATA      = 1;
+              usbd.INTEN |= USBD_INTEN_EPDATA_Msk;
+            }
+            interrupt();
+          }
+          assert(transfer_events == 1 && last_endpoint == (owner_ep | (owner_dir << 7)) && last_length == 64);
+          interrupt();
+          assert(transfer_events == 1);
+        }
+      }
+    }
+    return 0;
+  }
+  if (!strcmp(argv[1], "abort-sibling-timeout")) {
+    reset();
+    begin_in(0);
+    uint8_t old[64]    = {};
+    auto   *out        = &_dcd.xfer[1][TUSB_DIR_OUT];
+    out->mps           = 64;
+    out->data_received = true;
+    usbd.SIZE.EPOUT[1] = sizeof(old);
+    assert(dcd_edpt_xfer(0, 1, old, sizeof(old)));
+    hardware_dma_busy = true;
+    unsigned flushes  = 0;
+    on_register_write = [&](const Register *reg, uint32_t) {
+      if (reg == &usbd.EPDATASTATUS) {
+        ++flushes;
+      }
+    };
+    on_event_read = [&](uint32_t *) { assert(!primask && !flushes); };
+    assert(!dcd_edpt_abort(0, 1));
+    on_register_write = {};
+    on_event_read     = {};
+    assert(!usbd.ENABLE && !irq_enabled && !primask && unplugged_events == 1 && !flushes);
+    assert(out->buffer == old && out->mps == 64 && out->total_len == sizeof(old) && !out->actual_len);
+    assert(!_dcd.dma_running && !uint32_t(_dcd.dma_pending) && !errata_register.value);
+    assert(epstall_writes.empty() && dtoggle_writes.empty() && transfer_events == 0);
+    assert(event_reads > 0 && event_reads <= 21u * 21u * 2u);
+    return 0;
+  }
+  if (!strcmp(argv[1], "abort-dma-power") || !strcmp(argv[1], "abort-power-before-commit")) {
+    reset();
+    begin_in(2);
+    uint8_t old[64]    = {};
+    auto   *out        = &_dcd.xfer[1][TUSB_DIR_OUT];
+    out->mps           = 64;
+    out->data_received = true;
+    usbd.SIZE.EPOUT[1] = sizeof(old);
+    assert(dcd_edpt_xfer(0, 1, old, sizeof(old)));
+    const uint8_t generation = _ep0.received;
+    hardware_dma_busy        = true;
+    bool       removed       = false;
+    unsigned   mask_reads = 0, flushes = 0;
+    const auto remove = [&]() {
+      if (removed) {
+        return;
+      }
+      removed = true;
+      assert(!primask && !flushes);
+      hardware_dma_busy      = false;
+      usbd.EVENTS_ENDEPIN[2] = 1;
+      tusb_hal_nrf_power_event(1);
+      usbd.ENABLE = 1;
+    };
+    on_register_write = [&](const Register *reg, uint32_t) {
+      if (reg == &usbd.EPDATASTATUS) {
+        ++flushes;
+      }
+    };
+    if (!strcmp(argv[1], "abort-dma-power")) {
+      on_event_read = [&](uint32_t *) { remove(); };
+    } else {
+      hardware_dma_busy      = false;
+      usbd.EVENTS_ENDEPIN[2] = 1;
+      on_primask_read        = [&]() {
+        if (++mask_reads == 2) {
+          remove();
+        }
+      };
+    }
+    assert(!dcd_edpt_abort(0, 1));
+    on_register_write = {};
+    on_event_read     = {};
+    on_primask_read   = {};
+    assert(removed && _ep0.received == uint8_t(generation + 1) && usbd.ENABLE && !primask);
+    assert(unplugged_events == 1 && !flushes && transfer_events == 0);
+    assert(out->buffer == old && out->mps == 64 && out->total_len == sizeof(old) && !out->actual_len);
+    assert(!_dcd.dma_running && !uint32_t(_dcd.dma_pending));
+    assert(epstall_writes.empty() && dtoggle_writes.empty());
+    return 0;
+  }
+  if (!strcmp(argv[1], "abort-active")) {
+    for (const bool enabled: {false, true}) {
+      reset();
+      uint8_t old[128]   = {};
+      auto   *out        = &_dcd.xfer[1][TUSB_DIR_OUT];
+      out->mps           = 64;
+      out->data_received = true;
+      usbd.SIZE.EPOUT[1] = 32;
+      assert(dcd_edpt_xfer(0, 1, old, sizeof(old)));
+      hardware_dma_busy = true;
+      irq_enabled       = enabled;
+      bool     ended    = false;
+      unsigned polls    = 0;
+      on_event_read     = [&](uint32_t *) {
+        if (!ended && ++polls == 3) {
+          ended                   = true;
+          hardware_dma_busy       = false;
+          usbd.EPOUT[1].AMOUNT    = 32;
+          usbd.EVENTS_ENDEPOUT[1] = 1;
+        }
+      };
+      assert(dcd_edpt_abort(0, 1));
+      on_event_read = {};
+      assert(ended && !hardware_dma_busy && irq_enabled == enabled);
+      assert(!_dcd.dma_running && !uint32_t(_dcd.dma_pending) && !errata_register.value);
+      assert(out->buffer == old && out->mps == 64 && !out->total_len && !out->actual_len);
+      assert(!usbd.EVENTS_ENDEPOUT[1] && !usbd.SIZE.EPOUT[1]);
+      assert(epstall_writes.empty() && dtoggle_writes.empty() && transfer_events == 0);
+      usbd.INTEN = TU_BIT(USBD_INTEN_ENDEPOUT0_Pos + 1);
+      interrupt();
+      assert(transfer_events == 0 && !out->actual_len);
+    }
+    return 0;
+  }
+  if (!strcmp(argv[1], "abort-cached")) {
+    reset();
+    auto *out               = &_dcd.xfer[1][TUSB_DIR_OUT];
+    out->mps                = 64;
+    usbd.SIZE.EPOUT[1]      = 31;
+    usbd.EPDATASTATUS.value = TU_BIT(17);
+    usbd.EVENTS_EPDATA      = 1;
+    usbd.INTEN              = USBD_INTEN_EPDATA_Msk;
+    interrupt();
+    assert(out->data_received == 1 && !_dcd.dma_running);
+    assert(dcd_edpt_abort(0, 1));
+    assert(!out->data_received && !out->total_len && !out->actual_len && !usbd.SIZE.EPOUT[1]);
+    // During RESET_PENDING, more accepted data can only latch; it cannot DMA.
+    usbd.SIZE.EPOUT[1]      = 17;
+    usbd.EPDATASTATUS.value = TU_BIT(17);
+    usbd.EVENTS_EPDATA      = 1;
+    interrupt();
+    assert(out->data_received == 1 && usbd.TASKS_STARTEPOUT[1].triggers == 0);
+    assert(dcd_edpt_abort(0, 1));
+    assert(!out->data_received && !usbd.SIZE.EPOUT[1] && !usbd.EPDATASTATUS.value);
+    uint8_t fresh[64] = {};
+    assert(dcd_edpt_xfer(0, 1, fresh, sizeof(fresh)));
+    assert(usbd.TASKS_STARTEPOUT[1].triggers == 0);
+    usbd.SIZE.EPOUT[1]      = 23;
+    usbd.EPDATASTATUS.value = TU_BIT(17);
+    usbd.EVENTS_EPDATA      = 1;
+    interrupt();
+    assert(usbd.EPOUT[1].PTR == (uintptr_t)fresh && usbd.EPOUT[1].MAXCNT == 23);
+    memset((void *)usbd.EPOUT[1].PTR, 0x56, 23);
+    usbd.EPOUT[1].AMOUNT    = 23;
+    usbd.EVENTS_ENDEPOUT[1] = 1;
+    usbd.INTEN |= TU_BIT(USBD_INTEN_ENDEPOUT0_Pos + 1);
+    interrupt();
+    assert(transfer_events == 1 && last_endpoint == 1 && last_length == 23);
+    for (unsigned i = 0; i < 23; i++) {
+      assert(fresh[i] == 0x56);
+    }
+    assert(epstall_writes.empty() && dtoggle_writes.empty());
+    return 0;
+  }
+  if (!strcmp(argv[1], "abort-stale-end")) {
+    reset();
+    uint8_t old[64] = {}, fresh[64] = {};
+    auto   *out    = &_dcd.xfer[1][TUSB_DIR_OUT];
+    out->buffer    = old;
+    out->mps       = 64;
+    out->total_len = out->actual_len = 31;
+    out->data_received               = true;
+    usbd.EPOUT[1].AMOUNT             = 31;
+    usbd.EVENTS_ENDEPOUT[1] = usbd.EVENTS_EPDATA = 1;
+    usbd.EPDATASTATUS.value                      = TU_BIT(17);
+    usbd.SIZE.EPOUT[1]                           = 31;
+    assert(dcd_edpt_abort(0, 1));
+    assert(dcd_edpt_xfer(0, 1, fresh, sizeof(fresh)));
+    usbd.INTEN = TU_BIT(USBD_INTEN_ENDEPOUT0_Pos + 1) | USBD_INTEN_EPDATA_Msk;
+    interrupt();
+    // A raw END without an active owner must not complete the fresh request.
+    assert(transfer_events == 0 && out->buffer == fresh && out->actual_len == 0);
+    assert(usbd.TASKS_STARTEPOUT[1].triggers == 0 && !_dcd.dma_running);
+    assert(epstall_writes.empty() && dtoggle_writes.empty());
+    return 0;
+  }
+  if (!strcmp(argv[1], "abort-halted")) {
+    reset();
+    auto *out = &_dcd.xfer[1][TUSB_DIR_OUT];
+    out->mps  = 64;
+    dcd_edpt_stall(0, 1);
+    assert(out->data_received == OUT_HALTED && usbd.HALTED.EPOUT[1]);
+    const auto stalls       = epstall_writes;
+    usbd.SIZE.EPOUT[1]      = 32;
+    usbd.EPDATASTATUS.value = TU_BIT(17) | TU_BIT(19);
+    assert(dcd_edpt_abort(0, 1));
+    assert(out->data_received == OUT_HALTED && usbd.HALTED.EPOUT[1]);
+    assert(out->mps == 64 && !out->total_len && !out->actual_len && !usbd.SIZE.EPOUT[1]);
+    assert(usbd.EPDATASTATUS.value == TU_BIT(19));
+    assert(epstall_writes == stalls && dtoggle_writes.empty());
+    return 0;
+  }
+  if (!strcmp(argv[1], "abort-bounds-irq")) {
+    for (const bool enabled: {false, true}) {
+      reset();
+      irq_enabled             = enabled;
+      usbd.EPDATASTATUS.value = TU_BIT(17);
+      usbd.SIZE.EPOUT[1]      = 31;
+      unsigned char before_dcd[sizeof(_dcd)], before_usbd[sizeof(usbd)];
+      memcpy(before_dcd, &_dcd, sizeof(_dcd));
+      memcpy(before_usbd, &usbd, sizeof(usbd));
+      for (const uint8_t address: {0, 0x80, 0x81, 8, 0x88, 9, 0x89, 15, 0x8f, 0x11, 0x71, 0xff}) {
+        assert(!dcd_edpt_abort(0, address));
+        assert(!memcmp(before_dcd, &_dcd, sizeof(_dcd)) && !memcmp(before_usbd, &usbd, sizeof(usbd)));
+        assert(irq_enabled == enabled && !barriers);
+      }
+      assert(dcd_edpt_abort(0, 1));
+      assert(irq_enabled == enabled && !usbd.EPDATASTATUS.value && !usbd.SIZE.EPOUT[1]);
+      assert(epstall_writes.empty() && dtoggle_writes.empty());
+    }
+    return 0;
+  }
+  if (!strcmp(argv[1], "abort-timeout")) {
+    reset();
+    begin_out(1);
+    hardware_dma_busy = true;
+    assert(!dcd_edpt_abort(0, 1));
+    assert(!usbd.ENABLE && !irq_enabled && unplugged_events == 1);
+    assert(!_dcd.dma_running && !uint32_t(_dcd.dma_pending) && !errata_register.value);
+    assert(transfer_events == 0 && epstall_writes.empty() && dtoggle_writes.empty());
+    return 0;
+  }
+  if (!strcmp(argv[1], "abort-disabled")) {
+    for (const bool enabled: {false, true}) {
+      reset();
+      uint8_t old[64] = {};
+      auto   *out     = &_dcd.xfer[1][TUSB_DIR_OUT];
+      out->buffer     = old;
+      out->mps = out->total_len = 64;
+      out->actual_len           = 7;
+      out->data_received        = true;
+      _dcd.dma_running          = TU_BIT(DMA_OUT_BASE + 1);
+      _dcd.dma_pending          = TU_BIT(DMA_OUT_BASE + 3);
+      usbd.SIZE.EPOUT[1]        = 31;
+      usbd.EPDATASTATUS.value   = TU_BIT(17);
+      usbd.EVENTS_ENDEPOUT[1]   = 1;
+      usbd.ENABLE               = 0;
+      irq_enabled               = enabled;
+      unsigned char before_dcd[sizeof(_dcd)], before_usbd[sizeof(usbd)];
+      memcpy(before_dcd, &_dcd, sizeof(_dcd));
+      memcpy(before_usbd, &usbd, sizeof(usbd));
+      assert(!dcd_edpt_abort(0, 1));
+      assert(!irq_enabled && !memcmp(before_dcd, &_dcd, sizeof(_dcd)));
+      // Shared IRQ restoration orders prior accesses even when USB is off.
+      assert(!memcmp(before_usbd, &usbd, sizeof(usbd)) && barriers == 2);
+      assert(epstall_writes.empty() && dtoggle_writes.empty() && transfer_events == 0);
+    }
+    return 0;
+  }
+  if (!strcmp(argv[1], "clear-active-out") || !strcmp(argv[1], "clear-pending-out")) {
+    reset();
+    const bool pending = !strcmp(argv[1], "clear-pending-out");
+    if (pending) {
+      begin_in(2);
+    }
+    uint8_t buffer[128] = {};
+    auto   *out         = &_dcd.xfer[1][TUSB_DIR_OUT];
+    out->mps            = 64;
+    out->data_received  = true;
+    usbd.SIZE.EPOUT[1]  = 64;
+    assert(dcd_edpt_xfer(0, 1, buffer, sizeof(buffer)));
+    const uint32_t owner  = _dcd.dma_running;
+    const uint32_t queued = _dcd.dma_pending;
+    assert(owner == TU_BIT(pending ? DMA_IN_BASE + 2 : DMA_OUT_BASE + 1));
+    assert(queued == (pending ? TU_BIT(DMA_OUT_BASE + 1) : 0));
+    const unsigned starts   = usbd.TASKS_STARTEPOUT[1].triggers;
+    const uint32_t status   = TU_BIT(17) | TU_BIT(19);
+    usbd.EPDATASTATUS.value = status;
+    assert(!usbd.HALTED.EPOUT[1] && !out->data_received);
+    dcd_edpt_clear_stall(0, 1);
+    assert(out->buffer == buffer && out->total_len == sizeof(buffer) && !out->actual_len);
+    assert(out->mps == 64 && !out->data_received);
+    assert(_dcd.dma_running == owner && uint32_t(_dcd.dma_pending) == queued);
+    assert(usbd.EPDATASTATUS.value == status && usbd.SIZE.EPOUT[1] == 64);
+    assert(usbd.TASKS_STARTEPOUT[1].triggers == starts && transfer_events == 0);
+    assert((dtoggle_writes == std::vector<uint32_t>{1, 0x101}));
+    assert((epstall_writes == std::vector<uint32_t>{1}) && !usbd.HALTED.EPOUT[1]);
+    // Complete the original two-packet request, not a replacement descriptor.
+    if (pending) {
+      complete_in_dma(2);
+    }
+    assert(usbd.EPOUT[1].PTR == (uintptr_t)buffer && usbd.EPOUT[1].MAXCNT == 64);
+    usbd.INTEN = TU_BIT(USBD_INTEN_ENDEPOUT0_Pos + 1);
+    memset((void *)usbd.EPOUT[1].PTR, 0x51, 64);
+    usbd.EPOUT[1].AMOUNT    = 64;
+    usbd.EVENTS_ENDEPOUT[1] = 1;
+    interrupt();
+    assert(out->buffer == buffer + 64 && out->actual_len == 64 && transfer_events == 0);
+    usbd.EPDATASTATUS.value = TU_BIT(17);
+    usbd.EVENTS_EPDATA      = 1;
+    usbd.INTEN |= USBD_INTEN_EPDATA_Msk;
+    interrupt();
+    assert(usbd.EPOUT[1].PTR == (uintptr_t)(buffer + 64) && usbd.EPOUT[1].MAXCNT == 64);
+    memset((void *)usbd.EPOUT[1].PTR, 0x52, 64);
+    usbd.EPOUT[1].AMOUNT    = 64;
+    usbd.EVENTS_ENDEPOUT[1] = 1;
+    interrupt();
+    assert(transfer_events == 1 && last_endpoint == 1 && last_length == sizeof(buffer));
+    for (unsigned i = 0; i < sizeof(buffer); i++) {
+      assert(buffer[i] == (i < 64 ? 0x51 : 0x52));
+    }
+    return 0;
+  }
+  if (!strcmp(argv[1], "clear-received-out")) {
+    reset();
+    auto *out = &_dcd.xfer[1][TUSB_DIR_OUT];
+    out->mps  = 64;
+    // A real EPDATA interrupt caches a packet before a client supplies a buffer.
+    usbd.SIZE.EPOUT[1]      = 17;
+    usbd.EPDATASTATUS.value = TU_BIT(17);
+    usbd.EVENTS_EPDATA      = 1;
+    usbd.INTEN              = USBD_INTEN_EPDATA_Msk;
+    interrupt();
+    assert(out->data_received == 1 && !_dcd.dma_running && !uint32_t(_dcd.dma_pending));
+    usbd.EPDATASTATUS.value = TU_BIT(17) | TU_BIT(19);
+    dcd_edpt_clear_stall(0, 1);
+    assert(out->data_received == 1 && !out->buffer && !out->total_len && !out->actual_len && out->mps == 64);
+    assert(usbd.SIZE.EPOUT[1] == 17 && usbd.EPDATASTATUS.value == (TU_BIT(17) | TU_BIT(19)));
+    assert(!_dcd.dma_running && !uint32_t(_dcd.dma_pending));
+    assert((dtoggle_writes == std::vector<uint32_t>{1, 0x101}));
+    uint8_t buffer[64] = {};
+    assert(dcd_edpt_xfer(0, 1, buffer, sizeof(buffer)));
+    assert(usbd.EPOUT[1].PTR == (uintptr_t)buffer && usbd.EPOUT[1].MAXCNT == 17);
+    usbd.INTEN = TU_BIT(USBD_INTEN_ENDEPOUT0_Pos + 1);
+    memset((void *)usbd.EPOUT[1].PTR, 0x53, 17);
+    usbd.EPOUT[1].AMOUNT    = 17;
+    usbd.EVENTS_ENDEPOUT[1] = 1;
+    interrupt();
+    assert(transfer_events == 1 && last_endpoint == 1 && last_length == 17);
+    for (unsigned i = 0; i < 17; i++) {
+      assert(buffer[i] == 0x53);
+    }
+    return 0;
+  }
+  if (!strcmp(argv[1], "clear-halted-out")) {
+    reset();
+    auto *out = &_dcd.xfer[1][TUSB_DIR_OUT];
+    out->mps  = 64;
+    dcd_edpt_stall(0, 1);
+    assert(usbd.HALTED.EPOUT[1] == 1 && out->data_received == OUT_HALTED);
+    usbd.SIZE.EPOUT[1]      = 32;
+    usbd.SIZE.EPOUT[3]      = 19;
+    usbd.EPDATASTATUS.value = TU_BIT(17) | TU_BIT(19);
+    dcd_edpt_clear_stall(0, 1);
+    assert(!usbd.HALTED.EPOUT[1] && !out->data_received && usbd.SIZE.EPOUT[1] == 0);
+    assert(usbd.EPDATASTATUS.value == TU_BIT(19) && usbd.SIZE.EPOUT[3] == 19);
+    assert(!_dcd.dma_running && !uint32_t(_dcd.dma_pending) && transfer_events == 0);
+    assert(usbd.TASKS_STARTEPOUT[1].triggers == 0);
+    assert((dtoggle_writes == std::vector<uint32_t>{1, 0x101}));
+    assert((epstall_writes == std::vector<uint32_t>{0x101, 1}));
+    return 0;
+  }
+
+  if (!strcmp(argv[1], "stall-all-dma")) {
+    for (unsigned target_dir = 0; target_dir < 2; ++target_dir) {
+      for (unsigned owner_ep: {0u, 2u}) {
+        for (unsigned owner_dir = 0; owner_dir < 2; ++owner_dir) {
+          for (const bool enabled: {false, true}) {
+            reset();
+            if (owner_dir == TUSB_DIR_IN) {
+              _dcd.setup_dir = TUSB_DIR_IN;
+              begin_in(owner_ep);
+            } else {
+              begin_out(owner_ep);
+              if (!owner_ep) {
+                usbd.EVENTS_EP0DATADONE = 1;
+                usbd.INTEN |= USBD_INTEN_EP0DATADONE_Msk;
+                interrupt();
+              }
+            }
+            const uint32_t owner = TU_BIT((owner_dir == TUSB_DIR_IN ? DMA_IN_BASE : DMA_OUT_BASE) + owner_ep);
+            assert(_dcd.dma_running == owner);
+            auto      *active             = &_dcd.xfer[owner_ep][owner_dir];
+            const auto before             = *active;
+            uint8_t    sibling[32]        = {};
+            _dcd.xfer[3][TUSB_DIR_IN].mps = 64;
+            assert(dcd_edpt_xfer(0, 0x83, sibling, sizeof(sibling)));
+            const uint32_t pending = _dcd.dma_pending;
+            assert(pending == TU_BIT(DMA_IN_BASE + 3));
+            uint32_t *const raw_end =
+              owner_dir == TUSB_DIR_IN ? &usbd.EVENTS_ENDEPIN[owner_ep] : &usbd.EVENTS_ENDEPOUT[owner_ep];
+            hardware_dma_busy = true;
+            irq_enabled       = enabled;
+            unsigned polls    = 0;
+            on_event_read     = [&](uint32_t *) {
+              assert(!primask && !irq_enabled);
+              // Own-OUT retirement can re-observe the same already-finished sibling.
+              assert(epstall_writes.empty() || (!hardware_dma_busy && *raw_end == 1));
+              if (++polls == 3) {
+                hardware_dma_busy                                                              = false;
+                *raw_end                                                                       = 1;
+                (owner_dir == TUSB_DIR_IN ? usbd.EPIN[owner_ep] : usbd.EPOUT[owner_ep]).AMOUNT = 64;
+              }
+            };
+            const uint8_t target = 1 | (target_dir << 7);
+            on_epstall_write     = [&](uint32_t value) {
+              assert(!hardware_dma_busy && *raw_end == 1);
+              assert(primask == 1 && !irq_enabled && usbd.ENABLE && _dcd.dma_running == owner);
+              assert(value == (0x100u | target));
+            };
+            dcd_edpt_stall(0, target);
+            on_epstall_write = {};
+            on_event_read    = {};
+            assert(polls >= 3 && irq_enabled == enabled && !primask);
+            assert(epstall_writes == std::vector<uint32_t>{0x100u | target});
+            assert(*raw_end == 1 && _dcd.dma_running == owner && uint32_t(_dcd.dma_pending) == pending);
+            assert(active->buffer == before.buffer && active->total_len == before.total_len &&
+                   active->actual_len == before.actual_len && active->mps == before.mps &&
+                   active->data_received == before.data_received &&
+                   active->iso_in_transfer_ready == before.iso_in_transfer_ready);
+            assert(transfer_events == 0 && dtoggle_writes.empty());
+            assert((target_dir == TUSB_DIR_IN ? usbd.HALTED.EPIN[1] : usbd.HALTED.EPOUT[1]) == 1);
+            if (target_dir == TUSB_DIR_OUT) {
+              assert(_dcd.xfer[1][target_dir].data_received == OUT_HALTED);
+            }
+            usbd.INTEN |= owner;
+            interrupt();
+            assert(*raw_end == 0 && usbd.TASKS_STARTEPIN[3].triggers == 1);
+            assert(usbd.EPIN[3].PTR == (uintptr_t)sibling && usbd.EPIN[3].MAXCNT == sizeof(sibling));
+            if (owner_dir == TUSB_DIR_IN) {
+              if (!owner_ep) {
+                usbd.EVENTS_EP0DATADONE = 1;
+                usbd.INTEN |= USBD_INTEN_EP0DATADONE_Msk;
+              } else {
+                usbd.EPDATASTATUS.value = TU_BIT(owner_ep);
+                usbd.EVENTS_EPDATA      = 1;
+                usbd.INTEN |= USBD_INTEN_EPDATA_Msk;
+              }
+              interrupt();
+            }
+            assert(transfer_events == 1 && last_endpoint == (owner_ep | (owner_dir << 7)) && last_length == 64);
+            interrupt();
+            assert(transfer_events == 1); // The observed END must reach normal accounting once.
+          }
+        }
+      }
+    }
+    return 0;
+  }
+  if (!strcmp(argv[1], "stall-dma-timeout")) {
+    for (unsigned dir = 0; dir < 2; ++dir) {
+      reset();
+      begin_in(0);
+      hardware_dma_busy = true;
+      on_event_read     = [&](uint32_t *) { assert(!primask && epstall_writes.empty()); };
+      dcd_edpt_stall(0, 1 | (dir << 7));
+      on_event_read = {};
+      assert(!usbd.ENABLE && !irq_enabled && !primask && unplugged_events == 1);
+      assert(epstall_writes.empty() && dtoggle_writes.empty() && transfer_events == 0);
+      assert(!_dcd.dma_running && !uint32_t(_dcd.dma_pending) && !errata_register.value);
+      assert(event_reads > 0 && event_reads <= 21u * 21u * 2u);
+    }
+    return 0;
+  }
+  if (!strcmp(argv[1], "stall-dma-power") || !strcmp(argv[1], "stall-power-before-commit")) {
+    for (unsigned dir = 0; dir < 2; ++dir) {
+      reset();
+      begin_in(0);
+      hardware_dma_busy           = true;
+      const uint8_t generation    = _ep0.received;
+      bool          removed       = false;
+      unsigned      primask_reads = 0;
+      const auto    remove        = [&]() {
+        if (removed) {
+          return;
+        }
+        removed = true;
+        assert(!primask && epstall_writes.empty());
+        hardware_dma_busy      = false;
+        usbd.EVENTS_ENDEPIN[0] = 1;
+        tusb_hal_nrf_power_event(1);
+        usbd.ENABLE = 1; // Removal then a fresh power epoch before the stale call resumes.
+      };
+      if (!strcmp(argv[1], "stall-dma-power")) {
+        on_event_read = [&](uint32_t *) { remove(); };
+      } else {
+        hardware_dma_busy      = false;
+        usbd.EVENTS_ENDEPIN[0] = 1;
+        on_primask_read        = [&]() {
+          if (++primask_reads == 2) {
+            remove(); // Skip dma_cancel's own short critical section.
+          }
+        };
+      }
+      dcd_edpt_stall(0, 1 | (dir << 7));
+      on_event_read   = {};
+      on_primask_read = {};
+      assert(removed && _ep0.received == uint8_t(generation + 1));
+      assert(usbd.ENABLE && !primask && unplugged_events == 1);
+      assert(epstall_writes.empty() && dtoggle_writes.empty() && transfer_events == 0);
+      assert(!_dcd.dma_running && !uint32_t(_dcd.dma_pending));
+      assert(_dcd.xfer[1][TUSB_DIR_OUT].data_received != OUT_HALTED);
+    }
+    return 0;
+  }
+  if (!strcmp(argv[1], "stall-disabled")) {
+    for (unsigned previous_mask = 0; previous_mask < 2; ++previous_mask) {
+      for (const bool previous_irq: {false, true}) {
+        for (const bool controller_enabled: {false, true}) {
+          reset();
+          primask          = previous_mask;
+          irq_enabled      = previous_irq;
+          usbd.ENABLE      = controller_enabled;
+          on_epstall_write = [&](uint32_t) { assert(primask == 1 && !irq_enabled); };
+          dcd_edpt_stall(0, 0x81);
+          on_epstall_write = {};
+          assert(primask == previous_mask && irq_enabled ==
+                 (previous_irq && controller_enabled && !(CFG_TUD_NRF5X_CONTROL_STALL_QUIET && previous_mask)));
+          assert(unplugged_events == unsigned(CFG_TUD_NRF5X_CONTROL_STALL_QUIET && previous_mask && controller_enabled));
+          assert(dtoggle_writes.empty());
+          assert(epstall_writes.size() == unsigned(controller_enabled));
+          assert(!_dcd.xfer[1][TUSB_DIR_OUT].data_received);
+        }
+      }
+    }
+    return 0;
+  }
+  if (!strcmp(argv[1], "clear-active-in")) {
+    for (const bool stalled: {false, true}) {
+      reset();
+      begin_in(1);
+      auto          *in     = &_dcd.xfer[1][TUSB_DIR_IN];
+      const auto     before = *in;
+      const uint32_t owner  = _dcd.dma_running;
+      if (stalled) {
+        usbd.EVENTS_ENDEPIN[1] = 1; // END is observable but still owned by the ISR.
+        dcd_edpt_stall(0, 0x81);
+      }
+      assert(usbd.HALTED.EPIN[1] == unsigned(stalled));
+      usbd.EPDATASTATUS.value = TU_BIT(17);
+      usbd.SIZE.EPOUT[1]      = 31;
+      dcd_edpt_clear_stall(0, 0x81);
+      assert(in->buffer == before.buffer && in->total_len == before.total_len && in->actual_len == before.actual_len);
+      assert(in->mps == before.mps && in->data_received == before.data_received);
+      assert(_dcd.dma_running == owner && !uint32_t(_dcd.dma_pending));
+      assert(usbd.SIZE.EPOUT[1] == 31 && usbd.EPDATASTATUS.value == TU_BIT(17));
+      assert(!usbd.HALTED.EPIN[1] && transfer_events == 0);
+      assert((dtoggle_writes == std::vector<uint32_t>{0x81, 0x181}));
+      assert(epstall_writes.back() == 0x81);
+      complete_in_dma(1);
+      usbd.EPIN[1].AMOUNT = 64;
+      usbd.EPDATASTATUS.value = TU_BIT(1);
+      usbd.EVENTS_EPDATA      = 1;
+      usbd.INTEN |= USBD_INTEN_EPDATA_Msk;
+      interrupt();
+      assert(transfer_events == 1 && last_endpoint == 0x81 && last_length == 64);
+    }
+    return 0;
+  }
   if (!strcmp(argv[1], "stale-out")) {
     reset();
     _dcd.xfer[1][TUSB_DIR_OUT].mps = 64;
@@ -969,7 +1832,8 @@ int main(int argc, char **argv) {
     out->mps = 64; out->buffer = old_buffer; out->total_len = 64; out->data_received = true;
     usbd.SIZE.EPOUT[1] = 32;
     scb.ICSR = 16 + USBD_IRQn;
-    dcd_edpt_stall(0, 1); // Its drain is queued behind that DMA.
+    usbd.EVENTS_ENDEPIN[2] = 1; // Hardware finishes; stall must leave its accounting queued.
+    dcd_edpt_stall(0, 1);
     scb.ICSR = 0;
     dcd_edpt_clear_stall(0, 1);
     assert(dcd_edpt_xfer(0, 1, next_buffer, sizeof(next_buffer)));
@@ -1067,6 +1931,7 @@ int main(int argc, char **argv) {
     scb.ICSR = 16 + USBD_IRQn;
     assert(dcd_edpt_xfer(0, 1, old_buffer, sizeof(old_buffer)));
     assert(dcd_edpt_xfer(0, 0x83, unrelated, sizeof(unrelated)));
+    usbd.EVENTS_ENDEPIN[2] = 1; // Observe this END without consuming its sibling completion.
     dcd_edpt_stall(0, 1);
     scb.ICSR = 0;
     dcd_edpt_clear_stall(0, 1);
@@ -1171,6 +2036,7 @@ int main(int argc, char **argv) {
     assert(dcd_edpt_xfer(0, 1, old_buffer, sizeof(old_buffer)));
     assert(dcd_edpt_xfer(0, 0x83, unrelated, sizeof(unrelated)));
     scb.ICSR = 0;
+    usbd.EVENTS_ENDEPIN[2] = 1;
     dcd_edpt_close(0, 1);
     complete_in_dma(2); run_deferred_once();
     assert(usbd.TASKS_STARTEPOUT[1].triggers == 0 && usbd.TASKS_STARTEPIN[3].triggers == 1);
@@ -1188,8 +2054,9 @@ int main(int argc, char **argv) {
     assert(dcd_edpt_xfer(0, 1, old_buffer, sizeof(old_buffer)));
     assert(dcd_edpt_xfer(0, 0x83, unrelated, sizeof(unrelated)));
     scb.ICSR = 0;
+    usbd.EVENTS_ENDEPIN[0] = 1;
     dcd_edpt_close_all(0);
-    assert(_dcd.dma_running); // Closing data endpoints preserves active EP0.
+    assert(_dcd.dma_running); // Closing data endpoints preserves EP0 completion ownership.
     complete_in_dma(0); run_deferred_once();
     assert(usbd.TASKS_STARTEPOUT[1].triggers == 0 && usbd.TASKS_STARTEPIN[3].triggers == 0);
     for (unsigned ep = 1; ep < sizeof(_dcd.xfer) / sizeof(_dcd.xfer[0]); ++ep)
@@ -1333,10 +2200,32 @@ def main():
     parser.add_argument("--source", type=Path, help="Override the production driver for artifact/negative checks")
     parser.add_argument("--errata-enabled", type=int, choices=[0, 1], default=1)
     parser.add_argument("--iso", type=int, choices=[0, 1], help="Override the generic default ISO configuration")
+    parser.add_argument("--quiet-mode", type=int, choices=[0, 1],
+                        help="Exercise the opt-in serialized-task control/STALL quiet contract")
+    parser.add_argument("--negative-quiet-status", action="store_true",
+                        help="Require omitted post-STATUS spacing to fail task/event ordering")
+    parser.add_argument("--negative-quiet-stall", action="store_true",
+                        help="Require omitted post-STALL spacing to fail the completed-cleanup regression")
+    parser.add_argument("--negative-quiet-masked", action="store_true",
+                        help="Require a masked caller to fail if it enters the millisecond delay")
+    parser.add_argument("--negative-clear-active", action="store_true",
+                        help="Require the inherited unconditional OUT cleanup to fail the active-transfer regression")
+    parser.add_argument("--negative-abort-stale", action="store_true",
+                        help="Require omission of raw-END retirement to complete the wrong request")
+    parser.add_argument("--negative-stall-dma", action="store_true",
+                        help="Require the unfenced EPSTALL write to fail while a sibling DMA owns hardware")
+    parser.add_argument("--negative-abort-sibling", action="store_true",
+                        help="Require owned-only retirement to flush OUT during another endpoint's DMA")
+    parser.add_argument("--negative-abort-epoch", action="store_true",
+                        help="Require an omitted lifecycle gate to flush after removal/reattachment")
     parser.add_argument("--scenarios", nargs="+", default=[
         "latch", "reset-timeout", "removal-preempts-start", "timeout",
         "captured-end", "late-end", "other-end", "captured-end-next-dma", "direction",
         "stale-out", "stall-deferred", "stall-inflight", "reset-deferred",
+        "clear-active-out", "clear-pending-out", "clear-received-out", "clear-halted-out", "clear-active-in",
+        "abort-pending", "abort-active", "abort-cached", "abort-stale-end", "abort-halted", "abort-bounds-irq", "abort-timeout",
+        "abort-disabled", "abort-sibling-dma", "abort-sibling-timeout", "abort-dma-power", "abort-power-before-commit",
+        "stall-all-dma", "stall-dma-timeout", "stall-dma-power", "stall-power-before-commit", "stall-disabled",
         "fresh-out", "unrelated-pending", "removal-deferred", "close-deferred",
         "close-all", "power-preempts-request", "power-preempts-dispatch", "usb-preempts-removal",
         "endpoint-bounds", "remote-wakeup-sof",
@@ -1351,9 +2240,82 @@ def main():
     if args.source is not None:
         args.driver = args.source
     source = args.driver.read_text()
+    if args.negative_clear_active:
+        old = function(source, "void dcd_edpt_clear_stall")
+        changed, matches = re.subn(r"dir == TUSB_DIR_OUT && NRF_USBD->HALTED\.EPOUT\[epnum\]", "dir == TUSB_DIR_OUT", old)
+        assert matches == 1, "expected one guarded destructive OUT cleanup"
+        source = source.replace(old, changed, 1)
+        args.scenarios = ["clear-active-out"]
+    if args.negative_abort_stale:
+        assert not args.negative_clear_active, "run one negative control at a time"
+        old = function(source, "bool dcd_edpt_abort")
+        changed, matches = re.subn(r"NRF_USBD->EVENTS_ENDEPOUT\[epnum\]\s*=\s*0;", "(void)0;", old)
+        assert matches == 1, "expected one raw-END retirement in abort"
+        source = source.replace(old, changed, 1)
+        args.scenarios = ["abort-stale-end"]
+    if args.negative_stall_dma:
+        assert not args.negative_clear_active and not args.negative_abort_stale, "run one negative control at a time"
+        if "static uint32_t dma_commit_begin(" in source:
+            old = function(source, "static uint32_t dma_commit_begin")
+            changed, matches = re.subn(r"!dma_retire\(operations\)",
+                                      "(operations && !dma_retire(operations))", old)
+        else:
+            old = function(source, "void dcd_edpt_stall")
+            changed, matches = re.subn(r"if \(!dma_(?:wait_end|retire)\(0\)\)", "if (false)", old)
+        assert matches == 1, "expected one global-DMA stall fence"
+        source = source.replace(old, changed, 1)
+        args.scenarios = ["stall-all-dma"]
+    if args.negative_abort_sibling:
+        assert not (args.negative_clear_active or args.negative_abort_stale or args.negative_stall_dma or
+                    args.negative_abort_epoch), "run one negative control at a time"
+        old = function(source, "static bool dma_retire")
+        changed, matches = re.subn(r"if \(!dma_wait_end\(0\)\)",
+                                  "if ((operations & _dcd.dma_active) && !dma_wait_end(0))", old)
+        assert matches == 1, "expected one global-DMA retirement observer"
+        source = source.replace(old, changed, 1)
+        args.scenarios = ["abort-sibling-dma"]
+    if args.negative_abort_epoch:
+        assert not (args.negative_clear_active or args.negative_abort_stale or args.negative_stall_dma), \
+            "run one negative control at a time"
+        admission = "static uint32_t dma_commit_begin" if "static uint32_t dma_commit_begin(" in source else "bool dcd_edpt_abort"
+        old = function(source, admission)
+        changed, matches = re.subn(r"generation == _ep0\.received", "((void)generation, true)", old)
+        assert matches == 1, "expected one abort lifecycle admission gate"
+        source = source.replace(old, changed, 1)
+        args.scenarios = ["abort-dma-power", "abort-power-before-commit"]
+    quiet_negative = args.negative_quiet_status or args.negative_quiet_stall or args.negative_quiet_masked
+    if quiet_negative:
+        assert sum((args.negative_quiet_status, args.negative_quiet_stall, args.negative_quiet_masked,
+                    args.negative_clear_active, args.negative_abort_stale, args.negative_stall_dma,
+                    args.negative_abort_sibling, args.negative_abort_epoch)) == 1, "run one negative at a time"
+        args.quiet_mode = 1
+        if args.negative_quiet_status:
+            source, count = re.subn(r"if \(operation == DMA_EP0_STATUS\)\s*\{\s*task_quiet_delay\(\);\s*\}",
+                                    "(void)0;", source)
+            assert count == 1, "expected one post-STATUS quiet call"
+            args.scenarios, quiet_failure = ["quiet-status-thread"], "quiet_delay_calls == 1"
+        elif args.negative_quiet_stall:
+            old = function(source, "void dcd_edpt_stall")
+            changed, count = re.subn(r"task_quiet_delay\(\);", "(void)0;", old)
+            assert count == 1, "expected one post-STALL quiet call"
+            source = source.replace(old, changed, 1)
+            args.scenarios, quiet_failure = ["quiet-stall-cleanup"], "quiet_delay_calls==1"
+        else:
+            old = function(source, "static void task_quiet_delay")
+            changed = old.replace("if (__get_PRIMASK())", "if (false)", 1)
+            assert changed != old, "expected the masked-caller failclosed guard"
+            source = source.replace(old, changed, 1)
+            args.scenarios, quiet_failure = ["quiet-masked-policy"], "!primask"
+    elif args.quiet_mode == 1:
+        args.scenarios += ["quiet-status-thread", "quiet-status-isr", "quiet-stall-cleanup", "quiet-masked-policy",
+                           "quiet-lifecycle", "quiet-setup-order", "quiet-status-usb-progress", "quiet-unrelated"]
+    elif args.quiet_mode == 0 and "task_quiet_delay" in source:
+        args.scenarios += ["quiet-optout"]
     with tempfile.TemporaryDirectory(prefix="nrf5x-dma-test-") as directory:
         temp = Path(directory)
         config = f"#define NRFX_USBD_ERRATA_ENABLE {args.errata_enabled}\n"
+        if args.quiet_mode is not None:
+            config += f"#define CFG_TUD_NRF5X_CONTROL_STALL_QUIET {args.quiet_mode}\n"
         config += f"#define DCD_TEST_DRIVER_SETUP_TAGS {int('dcd_edpt0_setup_begin' in source)}\n"
         header = (ROOT / "src/device/dcd.h").read_text()
         config += f"#define DCD_TEST_HEADER_SETUP_TAGS {int('setup_tagid' in header)}\n"
@@ -1373,6 +2335,37 @@ def main():
             "-I", str(temp), "-I", str(ROOT / "src"), str(cpp), "-o", str(binary),
         ], check=True)
         for scenario in args.scenarios:
+            if quiet_negative:
+                result = subprocess.run([str(binary), scenario], cwd=temp, capture_output=True, text=True, timeout=2)
+                assert result.returncode != 0 and re.sub(r"\s+", "", quiet_failure) in re.sub(r"\s+", "", result.stderr), (
+                    "quiet negative must fail the actual ordering/context assertion", result.returncode, result.stderr)
+                print("nRF5x quiet: omitted spacing/context guard reproduced (negative control)")
+                continue
+            if args.negative_abort_sibling or args.negative_abort_epoch:
+                result = subprocess.run([str(binary), scenario], cwd=temp, capture_output=True, text=True, timeout=2)
+                expected = "!hardware_dma_busy && *raw_end == 1" if args.negative_abort_sibling else "!dcd_edpt_abort(0, 1)"
+                assert result.returncode != 0 and expected in result.stderr, (
+                    "negative control must reproduce unsafe abort admission", result.returncode, result.stderr)
+                print("nRF5x DMA: unsafe abort admission reproduced (negative control)")
+                continue
+            if args.negative_stall_dma:
+                result = subprocess.run([str(binary), scenario], cwd=temp, capture_output=True, text=True, timeout=2)
+                assert result.returncode != 0 and "!hardware_dma_busy && *raw_end == 1" in result.stderr, (
+                    "negative control must write EPSTALL before the sibling DMA END", result.returncode, result.stderr)
+                print("nRF5x DMA: unfenced EPSTALL overlaps sibling DMA (negative control)")
+                continue
+            if args.negative_abort_stale:
+                result = subprocess.run([str(binary), scenario], cwd=temp, capture_output=True, text=True, timeout=2)
+                assert result.returncode != 0 and "transfer_events == 0 && out->buffer == fresh" in result.stderr, (
+                    "negative control must deliver the stale END to the fresh request", result.returncode, result.stderr)
+                print("nRF5x DMA: omitted abort retirement completes fresh request with stale END (negative control)")
+                continue
+            if args.negative_clear_active:
+                result = subprocess.run([str(binary), scenario], cwd=temp, capture_output=True, text=True, timeout=2)
+                assert result.returncode != 0 and "EPDATASTATUS.value == status" in result.stderr, (
+                    "negative control must fail the preserved active OUT packet assertion", result.returncode, result.stderr)
+                print("nRF5x DMA: inherited already-clear OUT packet loss reproduced (negative control)")
+                continue
             subprocess.run([str(binary), scenario], cwd=temp, check=True, timeout=2)
             print(f"nRF5x DMA: {scenario} PASS")
 

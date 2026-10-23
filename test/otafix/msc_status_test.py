@@ -37,6 +37,7 @@ bool usbd_edpt_stalled(uint8_t rhport, uint8_t ep) { (void)rhport; return stalle
 bool usbd_edpt_busy(uint8_t rhport, uint8_t ep) { (void)rhport; (void)ep; return false; }
 bool usbd_edpt_claim(uint8_t rhport, uint8_t ep) { (void)rhport; (void)ep; return true; }
 bool usbd_edpt_release(uint8_t rhport, uint8_t ep) { (void)rhport; (void)ep; return true; }
+bool usbd_edpt_abort(uint8_t rhport, uint8_t ep) { (void)rhport; (void)ep; return false; }
 void dcd_event_xfer_complete(uint8_t rhport, uint8_t ep, uint32_t n, uint8_t result, bool isr) {
   (void)rhport; (void)ep; (void)n; (void)result; (void)isr;
 }

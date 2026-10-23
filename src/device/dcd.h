@@ -171,6 +171,11 @@ void dcd_edpt_stall           (uint8_t rhport, uint8_t ep_addr);
 // This API never calls with control endpoints, since it is auto cleared when receiving setup packet
 void dcd_edpt_clear_stall     (uint8_t rhport, uint8_t ep_addr);
 
+// Retire an endpoint buffer without changing halt or data toggle state.
+// Optional: false means unsupported or unable to retire safely. No completion
+// is generated; callers must fence completions already queued before the abort.
+bool dcd_edpt_abort(uint8_t rhport, uint8_t ep_addr) TU_ATTR_WEAK;
+
 //--------------------------------------------------------------------+
 // Event API (implemented by stack)
 //--------------------------------------------------------------------+

@@ -27,10 +27,29 @@ Local host regressions:
 ```sh
 python3 -B test/otafix/ci_status_test.py
 python3 -B test/otafix/nrf5x_power_test.py
-python3 -B test/otafix/nrf5x_dma_test.py
-python3 -B test/otafix/nrf5x_dma_test.py --iso 0
+python3 -B test/otafix/nrf5x_dma_test.py --quiet-mode 0
+python3 -B test/otafix/nrf5x_dma_test.py --iso 0 --quiet-mode 0
+python3 -B test/otafix/nrf5x_dma_test.py --negative-clear-active
+python3 -B test/otafix/nrf5x_dma_test.py --iso 0 --negative-clear-active
+python3 -B test/otafix/nrf5x_dma_test.py --negative-abort-stale
+python3 -B test/otafix/nrf5x_dma_test.py --iso 0 --negative-abort-stale
+python3 -B test/otafix/nrf5x_dma_test.py --negative-stall-dma
+python3 -B test/otafix/nrf5x_dma_test.py --iso 0 --negative-stall-dma
+python3 -B test/otafix/nrf5x_dma_test.py --negative-abort-sibling
+python3 -B test/otafix/nrf5x_dma_test.py --iso 0 --negative-abort-sibling
+python3 -B test/otafix/nrf5x_dma_test.py --negative-abort-epoch
+python3 -B test/otafix/nrf5x_dma_test.py --iso 0 --negative-abort-epoch
+python3 -B test/otafix/nrf5x_dma_test.py --quiet-mode 1
+python3 -B test/otafix/nrf5x_dma_test.py --iso 0 --quiet-mode 1
+python3 -B test/otafix/nrf5x_dma_test.py --negative-quiet-status
+python3 -B test/otafix/nrf5x_dma_test.py --iso 0 --negative-quiet-status
+python3 -B test/otafix/nrf5x_dma_test.py --negative-quiet-stall
+python3 -B test/otafix/nrf5x_dma_test.py --iso 0 --negative-quiet-stall
+python3 -B test/otafix/nrf5x_dma_test.py --negative-quiet-masked
+python3 -B test/otafix/nrf5x_dma_test.py --iso 0 --negative-quiet-masked
 python3 -B test/otafix/nrf5x_dma_test.py --errata-enabled 0 --scenarios identity
 python3 -B test/otafix/ep0_setup_test.py
+python3 -B test/otafix/clear_halt_test.py
 python3 -B test/otafix/breakpoint_header_test.py
 python3 -B test/otafix/msc_status_test.py
 python3 -B test/otafix/msc_drain_test.py
@@ -51,7 +70,7 @@ The legacy driver also needs pending-operation cancellation and bounded DMA
 retirement so old queued or in-flight work cannot reuse a new descriptor.
 Scenarios exercise fresh packets after clear-halt, unrelated endpoints, reset,
 removal, and interrupt preemption in both priority directions. These are host
-regressions rather than physical USB qualification. The 43 cases also check
+regressions rather than physical USB qualification. The 65 baseline cases also check
 ordered, bounded SETUP register reads, saved IRQ state, and the factored Nordic
 171/187 unlock-write sequence against actual register operations. The separate
 breakpoint-header regression preserves the debugger-enable guard, single
@@ -63,6 +82,60 @@ actual `EP0STATUS` task, including when bulk DMA delays that task. They check
 that a newer SETUP cancels pending status without a phantom completion, that
 completion reaches the queue before a subsequent SETUP, and that unrelated
 bulk work and the real ISR/thread context remain intact.
+
+`CFG_TUD_NRF5X_CONTROL_STALL_QUIET` defaults to zero in the generic driver.
+The bootloader opts in to a nominal 2 ms delay after actual EP0STATUS task and
+completion enqueue, and after bulk STALL has finished its descriptor cleanup.
+The global IRQ mask is restored before waiting; STALL retains its existing
+USBD IRQ mask. This requires one serialized USB task, no reentrant or higher
+priority endpoint STALL callers, and no caller-held global critical section.
+An unexpected PRIMASK-masked caller disables/unplugs USB instead of introducing
+a millisecond global wait. The check does not validate arbitrary BASEPRI or
+FAULTMASK critical sections. The SDK delay is not a wire-handshake indicator.
+
+Both ISO configurations run 73 cases with quiet spacing enabled and 66 with it
+disabled. Additional cases check task/completion order, thread/ISR contexts,
+finished OUT cleanup, continued USB/DMA progress from thread context, SETUP and
+power boundaries, and the masked-caller policy. Three behavioral negatives
+remove each post-task delay or the masked-caller guard. The core regression
+also checks every endpoint number and direction with driver/flag sentinels;
+an accessor mutation that aliases both directions must fail.
+
+The CLEAR_FEATURE regression runs actual USBD request dispatch and control
+completion. Endpoint-halt clear resets DATA0 even when already clear, as USB 2.0
+section 9.4.5 requires, while preserving active transfer and claim ownership.
+Both endpoint directions and repeated requests are covered; mutations restore
+the inherited skip and prematurely release ownership to reproduce failures.
+The Nordic regression also preserves an unhalted OUT packet/FIFO during this
+toggle reset, while a genuinely halted OUT endpoint still drops stale data.
+
+The optional OUT abort retires pending and active DMA before releasing buffer
+ownership, flushes only that endpoint's cached data and END event, and preserves
+halt and data toggle state. Disabled controllers and failed retirement fail
+closed. The core regression checks successful, rejected, and unsupported aborts;
+the Nordic tests cover stale END isolation, two reset-boundary flushes, IRQ
+state, unrelated transfers, and both ISO configurations. Removing the END flush
+reproduces an old completion reaching a newly armed buffer. Protocol callers
+must also fence completions already queued before abort.
+
+Retirement observes a sibling's active EasyDMA END before abort or close MMIO,
+while leaving that sibling's raw event, descriptor and queued work intact.
+Abort checks controller enable and removal generation again under a short
+global IRQ mask before clearing its descriptor and FIFO. Tests cover sibling
+EP0/CDC DMA, timeout, and removal/reattachment during and immediately after the
+wait; owned-only waiting and a removed epoch guard each reproduce unsafe
+cleanup. The clear-halt path is unchanged by this retirement fence.
+
+Before writing a non-control endpoint's halt register, the Nordic driver waits
+for the active EasyDMA END without consuming another endpoint's completion.
+The bounded wait detaches on timeout; a short interrupt-masked commit checks
+controller enable and removal generation before changing halt state. The tests
+cover EP0 and CDC DMA in both directions, preserved sibling accounting and
+pending transfers, removal/reattachment, and saved interrupt state. Removing
+the fence reproduces an EPSTALL write before DMA finishes. This follows
+[Nordic's register-access fence](https://github.com/NordicSemiconductor/nrfx/blob/e04a873799c0e7206166d62e2e4f185868acf8f9/drivers/src/nrfx_usbd.c#L1439-L1448);
+these host checks do not establish resolution of the physical concurrent
+GET_STATUS failure.
 
 The SETUP generation regressions exercise the admission contract from
 [#4068](https://github.com/hathach/tinyusb/pull/4068). Superseded requests cannot

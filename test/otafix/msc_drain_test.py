@@ -30,11 +30,13 @@ static struct {
 '''
 
 EXTRA_DECLARATIONS = r'''
-enum {
-  EXPECT_DISCARD = 5
-};
+enum { EXPECT_DISCARD = 5, EXPECT_INVALID_CBW = 6, EXPECT_RESET_PENDING = 7 };
 static unsigned begins, resets, generic_calls, read_calls, write_calls, builtin_calls, write_checks;
-static bool     command_active, write_busy;
+static bool     command_active, write_busy, write_fail, fixture_writable;
+static uint32_t write_limit;
+static bool     track_busy, fixture_busy[256];
+static bool     abort_supported;
+static unsigned abort_calls, abort_fail_call, status_calls;
 static struct {
   uint8_t  ep;
   uint8_t *buffer;
@@ -64,7 +66,7 @@ void tud_msc_reset_cb(void) {
 bool tud_msc_is_writable_cb(uint8_t lun) {
   (void)lun;
   write_checks++;
-  return true;
+  return fixture_writable;
 }
 
 static void submit(uint8_t opcode, uint32_t length, bool in) {
@@ -146,6 +148,7 @@ static void test_all_discard_paths(void) {
   drain_command(0xff, 16385);
 }
 static void clear_endpoint(uint8_t ep) {
+  if (stalled[ep]) fixture_busy[ep] = false;
   stalled[ep]                        = false;
   const tusb_control_request_t clear = {.bmRequestType = 0x02,
                                         .bRequest      = TUSB_REQ_CLEAR_FEATURE,
@@ -153,13 +156,17 @@ static void clear_endpoint(uint8_t ep) {
                                         .wIndex        = ep};
   assert(mscd_control_xfer_cb(0, CONTROL_STAGE_SETUP, &clear));
 }
-static void bot_reset(void) {
+static bool bot_reset_stage(uint8_t stage) {
   const tusb_control_request_t request = {.bmRequestType = 0x21,
                                           .bRequest      = MSC_REQ_RESET,
                                           .wValue        = 0,
                                           .wIndex        = 0,
                                           .wLength       = 0};
-  assert(mscd_control_xfer_cb(0, CONTROL_STAGE_SETUP, &request));
+  return mscd_control_xfer_cb(0, stage, &request);
+}
+static void bot_reset(void) {
+  assert(bot_reset_stage(CONTROL_STAGE_SETUP));
+  assert(bot_reset_stage(CONTROL_STAGE_ACK));
 }
 static void fresh_read_after_recovery(void) {
   unsigned previous_begins     = begins;
@@ -314,13 +321,228 @@ static void test_reset_stale_completion(uint32_t bytes) {
   assert(_mscd_itf.stage == MSC_STAGE_CMD && begins == 1 && resets == 1 && !command_active);
   /* The real old CBW is still present: no new host CBW has been copied. */
   assert(!mscd_xfer_cb(0, 1, XFER_RESULT_SUCCESS, bytes));
-  assert(_mscd_itf.stage == MSC_STAGE_NEED_RESET && stalled[1] && stalled[0x81]);
+  assert(_mscd_itf.stage == EXPECT_INVALID_CBW && !stalled[1] && stalled[0x81]);
   assert(begins == 1 && completed == 0 && !command_active);
   no_acceptance();
   bot_reset();
   clear_endpoint(0x81);
   clear_endpoint(1);
   fresh_read_after_recovery();
+}
+static void test_phase_out_discard(void) {
+  const uint32_t lengths[] = {1, 512, 4096, 4097, 8193};
+  for (unsigned i = 0; i < sizeof(lengths) / sizeof(lengths[0]); i++) {
+    const uint32_t length = lengths[i];
+    reset();
+    submit(SCSI_CMD_READ_10, length, false);
+    assert(_mscd_itf.stage == EXPECT_DISCARD && _mscd_itf.csw.status == MSC_CSW_STATUS_PHASE_ERROR);
+    assert(_mscd_itf.total_len == length && _mscd_itf.xferred_len == 0);
+    uint32_t remaining = length;
+    unsigned chunks = 0;
+    while (remaining) {
+      const uint32_t size = remaining < 4096 ? remaining : 4096;
+      assert(queued_count == chunks + 1 && queued[chunks].ep == 1);
+      assert(queued[chunks].buffer == _mscd_buf && queued[chunks].size == size);
+      memset(_mscd_buf, 0x35, size);
+      assert(mscd_xfer_cb(0, 1, XFER_RESULT_SUCCESS, size));
+      remaining -= size;
+      chunks++;
+      assert(!stalled[1] && !stalled[0x81] && _mscd_itf.xferred_len == 0);
+      no_acceptance();
+      check_sentinels();
+    }
+    assert(_mscd_itf.stage == MSC_STAGE_STATUS_SENT && queued[chunks].ep == 0x81);
+    assert(_mscd_itf.csw.status == MSC_CSW_STATUS_PHASE_ERROR && _mscd_itf.csw.data_residue == length);
+    assert(begins == 1 && completed == 0 && command_active);
+    accept_status();
+    assert(reads == 1 && completed == 1 && !command_active);
+    bot_reset();
+    clear_endpoint(0x81);
+    clear_endpoint(1);
+    fresh_read_after_recovery();
+  }
+
+  // BOT case13: a WRITE10 block cannot fit even one host byte per block.
+  reset();
+  _mscd_itf.cbw = (msc_cbw_t){.signature = MSC_CBW_SIGNATURE, .total_bytes = 1, .cmd_len = 10};
+  _mscd_itf.cbw.command[0] = SCSI_CMD_WRITE_10;
+  _mscd_itf.cbw.command[8] = 2;
+  assert(mscd_xfer_cb(0, 1, XFER_RESULT_SUCCESS, sizeof(msc_cbw_t)));
+  assert(_mscd_itf.stage == EXPECT_DISCARD && queued[0].size == 1);
+  assert(mscd_xfer_cb(0, 1, XFER_RESULT_SUCCESS, 1));
+  assert(_mscd_itf.stage == MSC_STAGE_STATUS_SENT);
+  assert(_mscd_itf.csw.status == MSC_CSW_STATUS_PHASE_ERROR && _mscd_itf.csw.data_residue == 1);
+  no_acceptance();
+
+  // A failure after an earlier received chunk drains only the remainder.
+  reset();
+  _mscd_itf.cbw = (msc_cbw_t){.signature = MSC_CBW_SIGNATURE, .total_bytes = 8192, .command = {SCSI_CMD_WRITE_10}};
+  _mscd_itf.xferred_len = 4096;
+  fail_scsi_op(0, &_mscd_itf, MSC_CSW_STATUS_FAILED);
+  assert(_mscd_itf.stage == EXPECT_DISCARD && !stalled[1] && !stalled[0x81]);
+  assert(queued_count == 1 && queued[0].size == 4096 && _mscd_itf.total_len == 4096);
+  assert(mscd_xfer_cb(0, 1, XFER_RESULT_SUCCESS, 4096));
+  assert(_mscd_itf.stage == MSC_STAGE_STATUS_SENT);
+  assert(_mscd_itf.xferred_len == 4096 && _mscd_itf.csw.data_residue == 4096);
+  no_acceptance();
+
+  reset();
+  submit(SCSI_CMD_WRITE_10, 8192, false);
+  write_fail = true;
+  assert(mscd_xfer_cb(0, 1, XFER_RESULT_SUCCESS, 4096));
+  assert(write_calls == 1 && write_checks == 1 && _mscd_itf.xferred_len == 4096);
+  assert(_mscd_itf.stage == EXPECT_DISCARD && !stalled[1] && !stalled[0x81]);
+  assert(queued_count == 2 && queued[1].ep == 1 && queued[1].size == 4096);
+  assert(mscd_xfer_cb(0, 1, XFER_RESULT_SUCCESS, 4096));
+  assert(_mscd_itf.stage == MSC_STAGE_STATUS_SENT && queued_count == 3 && queued[2].ep == 0x81);
+  assert(write_calls == 1 && _mscd_itf.xferred_len == 4096);
+  assert(_mscd_itf.csw.status == MSC_CSW_STATUS_FAILED && _mscd_itf.csw.data_residue == 4096);
+  assert(generic_calls == 0 && read_calls == 0 && accepts == 0 && completed == 0);
+
+  reset();
+  submit(SCSI_CMD_WRITE_10, 8192, false);
+  write_limit = 1024;
+  assert(mscd_xfer_cb(0, 1, XFER_RESULT_SUCCESS, 4096));
+  uint32_t generation;
+  assert(tud_msc_write10_retry_snapshot(&generation));
+  assert(_mscd_itf.xferred_len == 1024 && _mscd_itf.write10_retry_bytes == 3072);
+  write_fail = true;
+  assert(tud_msc_write10_retry(generation));
+  assert(write_calls == 2 && _mscd_itf.xferred_len == 4096);
+  assert(!tud_msc_write10_retry_snapshot(&generation));
+  assert(_mscd_itf.stage == EXPECT_DISCARD && queued[1].size == 4096);
+  assert(mscd_xfer_cb(0, 1, XFER_RESULT_SUCCESS, 4096));
+  assert(write_calls == 2 && _mscd_itf.csw.status == MSC_CSW_STATUS_FAILED);
+  assert(_mscd_itf.csw.data_residue == 4096 && _mscd_itf.stage == MSC_STAGE_STATUS_SENT);
+
+  reset();
+  fixture_writable = false;
+  submit(SCSI_CMD_WRITE_10, 8192, false);
+  assert(write_checks == 1 && write_calls == 0 && _mscd_itf.stage == EXPECT_DISCARD);
+  assert(_mscd_itf.total_len == 8192 && queued_count == 1 && queued[0].size == 4096);
+  assert(mscd_xfer_cb(0, 1, XFER_RESULT_SUCCESS, 4096));
+  assert(mscd_xfer_cb(0, 1, XFER_RESULT_SUCCESS, 4096));
+  assert(write_calls == 0 && _mscd_itf.csw.status == MSC_CSW_STATUS_FAILED);
+  assert(_mscd_itf.csw.data_residue == 8192 && _mscd_itf.stage == MSC_STAGE_STATUS_SENT);
+}
+static void invalid_cbw_discard_case(uint32_t initial_bytes, uint32_t signature) {
+  reset();
+  track_busy = true;
+  _mscd_itf.cbw.signature = signature;
+  assert(!mscd_xfer_cb(0, 1, XFER_RESULT_SUCCESS, initial_bytes));
+  assert(_mscd_itf.stage == EXPECT_INVALID_CBW && stalled[0x81] && !stalled[1]);
+  assert(queued_count == 1 && queued[0].buffer == _mscd_buf);
+  assert(queued[0].size == sizeof(_mscd_buf) && queued[0].ep == 1 && fixture_busy[1]);
+  no_acceptance();
+  assert(begins == 0 && completed == 0);
+  _mscd_itf.csw.signature = 0x1234abcd;
+  _mscd_itf.csw.tag = 0x9876fedc;
+  for (unsigned i = 0; i < 20; i++) {
+    const unsigned size = (i & 1) ? sizeof(msc_cbw_t) : sizeof(_mscd_buf);
+    memset(_mscd_buf, 0x6c, sizeof(_mscd_buf));
+    msc_cbw_t ignored = {.signature = MSC_CBW_SIGNATURE, .total_bytes = 512, .cmd_len = 10};
+    ignored.command[0] = SCSI_CMD_WRITE_10;
+    ignored.command[8] = 1;
+    memcpy(_mscd_buf, &ignored, sizeof(ignored));
+    fixture_busy[1] = false; // USBD releases endpoint ownership before class callback.
+    assert(mscd_xfer_cb(0, 1, XFER_RESULT_SUCCESS, size));
+    assert(_mscd_itf.stage == EXPECT_INVALID_CBW && stalled[0x81] && !stalled[1]);
+    assert(queued_count == i + 2 && queued[i + 1].size == sizeof(_mscd_buf) && fixture_busy[1]);
+    assert(queued[i + 1].buffer == _mscd_buf && _mscd_itf.cbw.signature == signature);
+    assert(_mscd_itf.csw.signature == 0x1234abcd && _mscd_itf.csw.tag == 0x9876fedc);
+    no_acceptance();
+    assert(begins == 0 && completed == 0);
+    check_sentinels();
+  }
+  clear_endpoint(0x81);
+  clear_endpoint(1);
+  assert(stalled[0x81] && !stalled[1] && fixture_busy[1] && queued_count == 21);
+  assert(_mscd_itf.stage == EXPECT_INVALID_CBW);
+  bot_reset();
+  assert(_mscd_itf.stage == MSC_STAGE_CMD && _mscd_itf.cbw.signature == 0);
+  assert(stalled[0x81] && !stalled[1] && fixture_busy[1]);
+  clear_endpoint(0x81);
+  clear_endpoint(1);
+  assert(!stalled[0x81] && !stalled[1] && fixture_busy[1] && queued_count == 22);
+  // Both aborts release the old receiver before the ACK queues a fresh CBW.
+  assert(abort_calls == 3);
+  assert(queued[21].buffer == (uint8_t *)&_mscd_itf.cbw && queued[21].size == sizeof(msc_cbw_t));
+  fixture_busy[1] = false;
+  track_busy = false;
+  fresh_read_after_recovery();
+}
+static void test_invalid_cbw_discard(void) {
+  invalid_cbw_discard_case(31, 0);
+  invalid_cbw_discard_case(30, MSC_CBW_SIGNATURE);
+  invalid_cbw_discard_case(64, MSC_CBW_SIGNATURE);
+}
+static void begin_invalid(void) {
+  reset();
+  track_busy = true;
+  _mscd_itf.cbw.signature = 0;
+  assert(!mscd_xfer_cb(0, 1, XFER_RESULT_SUCCESS, sizeof(msc_cbw_t)));
+  assert(_mscd_itf.stage == EXPECT_INVALID_CBW && abort_calls == 1);
+}
+static void test_reset_completion_barrier(void) {
+  begin_invalid();
+  // The invalid-length CBW can have valid signature and WRITE fields, while
+  // subsequent discarded packets go only to the separate class buffer.
+  _mscd_itf.cbw = (msc_cbw_t){.signature = MSC_CBW_SIGNATURE, .total_bytes = 512, .cmd_len = 10};
+  _mscd_itf.cbw.command[0] = SCSI_CMD_WRITE_10;
+  _mscd_itf.cbw.command[8] = 1;
+  memcpy(_mscd_buf, &_mscd_itf.cbw, sizeof(msc_cbw_t));
+  assert(bot_reset_stage(CONTROL_STAGE_SETUP));
+  assert(_mscd_itf.stage == EXPECT_RESET_PENDING && abort_calls == 2);
+  assert(status_calls == 1 && resets == 0 && !fixture_busy[1]);
+  assert(queued_count == 1 && stalled[0x81] && !stalled[1]);
+  // A superseded status stage has not committed the reset. CLEAR alone must
+  // still rehalt IN while it leaves OUT ownership and pending state alone.
+  clear_endpoint(0x81);
+  clear_endpoint(1);
+  assert(stalled[0x81] && !stalled[1] && _mscd_itf.stage == EXPECT_RESET_PENDING);
+  assert(queued_count == 1 && abort_calls == 2 && resets == 0);
+  assert(mscd_xfer_cb(0, 1, XFER_RESULT_SUCCESS, 31));
+  assert(begins == 0 && write_calls == 0 && generic_calls == 0);
+  assert(mscd_xfer_cb(0, 1, XFER_RESULT_SUCCESS, 64));
+  assert(mscd_xfer_cb(0, 0x81, XFER_RESULT_SUCCESS, 13));
+  assert(_mscd_itf.stage == EXPECT_RESET_PENDING && queued_count == 1);
+  assert(bot_reset_stage(CONTROL_STAGE_ACK));
+  assert(_mscd_itf.stage == MSC_STAGE_CMD && resets == 1 && abort_calls == 3);
+  assert(_mscd_itf.cbw.signature == 0 && queued_count == 2 && queued[1].size == sizeof(msc_cbw_t));
+  assert(fixture_busy[1] && stalled[0x81] && !stalled[1]);
+  clear_endpoint(0x81);
+  clear_endpoint(1);
+  assert(queued_count == 2 && !stalled[0x81] && !stalled[1]);
+  fixture_busy[1] = false;
+  track_busy = false;
+  fresh_read_after_recovery();
+
+  // Missing abort support keeps the legacy both-halted invalid-CBW policy.
+  reset();
+  abort_supported = false;
+  assert(!mscd_xfer_cb(0, 1, XFER_RESULT_SUCCESS, sizeof(msc_cbw_t)));
+  assert(_mscd_itf.stage == MSC_STAGE_NEED_RESET && stalled[1] && stalled[0x81] && queued_count == 0);
+  bot_reset();
+  assert(abort_calls == 1 && resets == 1 && _mscd_itf.stage == MSC_STAGE_CMD);
+  clear_endpoint(0x81);
+  clear_endpoint(1);
+  fresh_read_after_recovery();
+
+  begin_invalid();
+  abort_fail_call = 2;
+  assert(!bot_reset_stage(CONTROL_STAGE_SETUP));
+  assert(_mscd_itf.stage == EXPECT_RESET_PENDING && status_calls == 0 && resets == 0 && queued_count == 1);
+  abort_fail_call = 0;
+  assert(bot_reset_stage(CONTROL_STAGE_SETUP));
+  assert(bot_reset_stage(CONTROL_STAGE_ACK));
+  assert(_mscd_itf.stage == MSC_STAGE_CMD && resets == 1 && queued_count == 2);
+
+  begin_invalid();
+  assert(bot_reset_stage(CONTROL_STAGE_SETUP));
+  abort_fail_call = 3;
+  assert(!bot_reset_stage(CONTROL_STAGE_ACK));
+  assert(_mscd_itf.stage == EXPECT_RESET_PENDING && resets == 0 && queued_count == 1);
+  assert(!fixture_busy[1] && stalled[0x81] && !stalled[1]);
 }
 int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "reset-stale31") == 0) {
@@ -331,6 +553,18 @@ int main(int argc, char **argv) {
     test_reset_stale_completion(4096);
     return 0;
   }
+  if (argc > 1 && strcmp(argv[1], "phase-out") == 0) {
+    test_phase_out_discard();
+    return 0;
+  }
+  if (argc > 1 && strcmp(argv[1], "invalid-cbw") == 0) {
+    test_invalid_cbw_discard();
+    return 0;
+  }
+  if (argc > 1 && strcmp(argv[1], "reset-barrier") == 0) {
+    test_reset_completion_barrier();
+    return 0;
+  }
   assert(legacy_status_tests() == 0);
   test_all_discard_paths();
   test_malformed_discard();
@@ -338,6 +572,9 @@ int main(int argc, char **argv) {
   test_clear_during_discard();
   test_read_write_and_deferred_retry();
   test_neighbor_paths();
+  test_phase_out_discard();
+  test_invalid_cbw_discard();
+  test_reset_completion_barrier();
   test_reset_stale_completion(31);
   test_reset_stale_completion(4096);
   return 0;
@@ -357,6 +594,8 @@ def harness():
                         '  (void)rhport; (void)ep; (void)buffer; (void)size;\n  return true;',
                         '  (void)rhport;\n  check_sentinels();\n'
                         '  assert(queued_count < 128);\n'
+                        '  if (track_busy) assert(!fixture_busy[ep]);\n'
+                        '  fixture_busy[ep] = true;\n'
                         '  if (buffer == _mscd_buf) assert(size <= sizeof(_mscd_buf));\n'
                         '  queued[queued_count].ep = ep; queued[queued_count].buffer = buffer;\n'
                         '  queued[queued_count++].size = size;\n  return true;')
@@ -366,7 +605,8 @@ def harness():
     text = replace_once(text, '(void)lun; (void)lba; (void)off; memset(b, 0, n);',
                         '(void)lun; (void)lba; (void)off; read_calls++; memset(b, 0, n);')
     text = replace_once(text, '(void)lun; (void)lba; (void)off; (void)b; return (int32_t)n;',
-                        '(void)lun; (void)lba; (void)off; (void)b; write_calls++; return write_busy ? 0 : (int32_t)n;')
+                        '(void)lun; (void)lba; (void)off; (void)b; write_calls++; '
+                        'return write_fail ? -1 : write_busy ? 0 : write_limit && n > write_limit ? (int32_t)write_limit : (int32_t)n;')
     text = replace_once(text, '(void)lun; (void)cmd; (void)b; (void)n; return -1;',
                         '(void)lun; (void)cmd; (void)b; (void)n; generic_calls++; return -1;')
     text = replace_once(text, '  pending_eject = false;\n  completed++;',
@@ -376,29 +616,59 @@ def harness():
                         '  queued_count = 0; command_active = write_busy = false;\n'
                         '  fixture_buffer.before = UINT64_C(0x53a9e18d72c406bf);\n'
                         '  fixture_buffer.after = UINT64_C(0xb086e52a34f719cd);')
+    text = replace_once(text,
+                        'bool usbd_edpt_busy(uint8_t rhport, uint8_t ep) { (void)rhport; (void)ep; return false; }',
+                        'bool usbd_edpt_busy(uint8_t rhport, uint8_t ep) { (void)rhport; return track_busy && fixture_busy[ep]; }')
+    text = replace_once(text,
+                        'bool usbd_edpt_abort(uint8_t rhport, uint8_t ep) { (void)rhport; (void)ep; return false; }',
+                        'bool usbd_edpt_abort(uint8_t rhport, uint8_t ep) {\n'
+                        '  (void)rhport; assert(ep == 1); abort_calls++;\n'
+                        '  if (!abort_supported || abort_calls == abort_fail_call) return false;\n'
+                        '  fixture_busy[ep] = false; return true;\n}')
+    text = replace_once(text, '(void)rhport; (void)r; return true;',
+                        '(void)rhport; (void)r; status_calls++; return true;')
+    text = replace_once(text, '  queued_count = 0; command_active = write_busy = false;',
+                        '  queued_count = 0; command_active = write_busy = write_fail = track_busy = false;\n'
+                        '  write_limit = 0; fixture_writable = true;\n'
+                        '  abort_supported = true; abort_calls = abort_fail_call = status_calls = 0;\n'
+                        '  memset(fixture_busy, 0, sizeof(fixture_busy));')
     return replace_once(text, 'int main(void)', 'static int legacy_status_tests(void)') + EXTRA_TESTS
 
 
-def inherited_large_out_failure(driver):
-    """Restore the inherited rejection at the same large-OUT decision."""
-    marker = 'if (p_cbw->total_bytes > sizeof(_mscd_buf))'
-    assert driver.count(marker) == 1, 'cannot isolate large-OUT admission'
-    opening = driver.index('{', driver.index(marker))
-    depth, end = 1, opening + 1
-    while depth:
-        depth += (driver[end] == '{') - (driver[end] == '}')
-        end += 1
-    assert 'MSC_STAGE_DISCARD' in driver[opening:end], 'discard admission missing'
-    return driver[:opening + 1] + '\n            fail_scsi_op(rhport, p_msc, MSC_CSW_STATUS_FAILED);\n          ' + driver[end - 1:]
+def inherited_out_failure(driver):
+    """Restore the inherited OUT stall in the shared rejected-data path."""
+    before = '''      p_msc->total_len = residue;
+      p_msc->stage     = MSC_STAGE_DISCARD;
+      TU_ASSERT(queue_out(rhport, p_msc, tu_min32(p_msc->total_len, sizeof(_mscd_buf))), );'''
+    return replace_once(driver, before, '      usbd_edpt_stall(rhport, p_msc->ep_out);')
 
 
-def run_source(source, scenario, negative=False, remove_reset_guard=False):
+def inherited_invalid_cbw(driver):
+    before = '''        if (usbd_edpt_abort(rhport, p_msc->ep_out)) {
+          p_msc->stage = MSC_STAGE_INVALID_CBW;
+          TU_ASSERT(queue_out(rhport, p_msc, sizeof(_mscd_buf)));
+        } else {
+          // DCDs without abort support retain the legacy halted receiver.
+          p_msc->stage = MSC_STAGE_NEED_RESET;
+          usbd_edpt_stall(rhport, p_msc->ep_out);
+        }'''
+    after = '''        p_msc->stage = MSC_STAGE_NEED_RESET;
+        usbd_edpt_stall(rhport, p_msc->ep_out);'''
+    return replace_once(driver, before, after)
+
+
+def run_source(source, scenario, negative=False, remove_reset_guard=False, negative_invalid=False, negative_barrier=False):
     with tempfile.TemporaryDirectory(prefix='msc-drain-') as directory:
         temp = Path(directory)
         (temp / 'tusb_config.h').write_text(BASE.CONFIG.replace('CFG_TUD_MSC_EP_BUFSIZE 512', 'CFG_TUD_MSC_EP_BUFSIZE 4096'))
         driver = source.read_text()
         if negative:
-            driver = inherited_large_out_failure(driver)
+            driver = inherited_out_failure(driver)
+        if negative_invalid:
+            driver = inherited_invalid_cbw(driver)
+        if negative_barrier:
+            driver = replace_once(driver, '    case MSC_STAGE_CMD:',
+                                  '    case MSC_STAGE_RESET_PENDING:\n    case MSC_STAGE_CMD:')
         if remove_reset_guard:
             driver = replace_once(driver, '  p_msc->cbw.signature = 0;', '')
         declaration = 'CFG_TUSB_MEM_SECTION CFG_TUSB_MEM_ALIGN static uint8_t _mscd_buf[CFG_TUD_MSC_EP_BUFSIZE];'
@@ -416,14 +686,22 @@ def run_source(source, scenario, negative=False, remove_reset_guard=False):
                         str(test), '-Wl,--gc-sections', '-o', str(binary)], check=True)
         command = [str(binary)] + ([] if scenario == 'all' else [scenario])
         result = subprocess.run(command, cwd=temp, capture_output=True, text=True, timeout=10)
-        if remove_reset_guard:
+        if negative_barrier:
+            if result.returncode == 0 or 'begins == 0 && write_calls == 0 && generic_calls == 0' not in result.stderr:
+                raise AssertionError(f'reset barrier removal did not admit old CBW: {result.returncode}\n{result.stderr}')
+            print('NEGATIVE PASS: dispatching old OUT during RESET_PENDING admits discarded WRITE-shaped CBW')
+        elif remove_reset_guard:
             if result.returncode == 0 or '!mscd_xfer_cb' not in result.stderr:
                 raise AssertionError(f'reset guard removal did not reproduce stale admission: {result.returncode}\n{result.stderr}')
             print('NEGATIVE PASS: removing only reset signature invalidation re-admits old 31-byte completion')
+        elif negative_invalid:
+            if result.returncode == 0 or '_mscd_itf.stage == EXPECT_INVALID_CBW' not in result.stderr:
+                raise AssertionError(f'old invalidCBW policy did not fail discard: {result.returncode}\n{result.stderr}')
+            print('NEGATIVE PASS: inherited invalidCBW OUTstall fails persistent bounded discard')
         elif negative:
             if result.returncode == 0 or '_mscd_itf.stage == EXPECT_DISCARD' not in result.stderr:
                 raise AssertionError(f'old driver did not fail real discard behavior: {result.returncode}\n{result.stderr}')
-            print('NEGATIVE PASS: inherited large-OUT rejection reproduces failed DISCARD admission')
+            print(f'NEGATIVE PASS: inherited OUTstall reproduces failed DISCARD admission ({scenario})')
         elif result.returncode:
             raise AssertionError(f'{source} scenario={scenario} exited {result.returncode}\n{result.stderr}')
         else:
@@ -433,15 +711,18 @@ def run_source(source, scenario, negative=False, remove_reset_guard=False):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source', type=Path, default=CANDIDATE)
-    parser.add_argument('--scenario', choices=('all', 'reset-stale31', 'reset-stale4096'), default='all')
+    parser.add_argument('--scenario', choices=('all', 'reset-stale31', 'reset-stale4096', 'phase-out', 'invalid-cbw', 'reset-barrier'), default='all')
     parser.add_argument('--negative-old', action='store_true')
     parser.add_argument('--negative-reset-guard', action='store_true')
     args = parser.parse_args()
     run_source(args.source, args.scenario)
     if args.negative_old:
         run_source(args.source, 'all', negative=True)
+        run_source(args.source, 'phase-out', negative=True)
+        run_source(args.source, 'invalid-cbw', negative_invalid=True)
     if args.negative_reset_guard:
         run_source(args.source, 'reset-stale31', remove_reset_guard=True)
+        run_source(args.source, 'reset-barrier', negative_barrier=True)
 
 
 if __name__ == '__main__':

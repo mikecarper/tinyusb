@@ -90,6 +90,10 @@ void usbd_edpt_stall(uint8_t rhport, uint8_t ep_addr);
 // Clear stalled endpoint
 void usbd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr);
 
+// Release transfer ownership only after the controller safely retires it.
+// Halt state is preserved; the caller must fence already queued completions.
+bool usbd_edpt_abort(uint8_t rhport, uint8_t ep_addr);
+
 // Check if endpoint is stalled
 bool usbd_edpt_stalled(uint8_t rhport, uint8_t ep_addr);
 

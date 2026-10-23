@@ -35,6 +35,13 @@
 #include "device/dcd.h"
 
 #include "device/usbd.h"
+#ifndef CFG_TUD_NRF5X_CONTROL_STALL_QUIET
+#define CFG_TUD_NRF5X_CONTROL_STALL_QUIET 0
+#endif
+#if CFG_TUD_NRF5X_CONTROL_STALL_QUIET
+#include "nrf_delay.h"
+#endif
+
 
 #ifndef CFG_TUD_NRF5X_ISO
 #define CFG_TUD_NRF5X_ISO 1
@@ -89,14 +96,14 @@ typedef struct
 // Data for managing dcd
 static struct
 {
-  // All 8 endpoints including control IN & OUT (offset 1)
-  // +1 for ISO endpoints
-  xfer_td_t xfer[EP_CBI_COUNT + CFG_TUD_NRF5X_ISO][2];
-
   // nRF can only carry one DMA at a time, this is used to guard the access to EasyDMA
   volatile uint32_t dma_active; // one-hot END event of the DMA that owns the channel
   volatile uint8_t setup_dir; // captured with SETUP; its registers are unreadable during an OUT DMA
   uint32_t dma_pending;
+
+  // All 8 endpoints including control IN & OUT (offset 1)
+  // +1 for ISO endpoints
+  xfer_td_t xfer[EP_CBI_COUNT + CFG_TUD_NRF5X_ISO][2];
 }_dcd;
 
 // Keep generations across bus_reset() clearing the transfer descriptors.
@@ -196,7 +203,7 @@ static void edpt_dma_end(void) {
 }
 
 // helper getting td
-static inline xfer_td_t *get_td(uint8_t epnum, uint8_t dir) {
+static __attribute__((noinline)) xfer_td_t *get_td(uint8_t epnum, uint8_t dir) {
   return &_dcd.xfer[epnum][dir];
 }
 
@@ -236,6 +243,12 @@ static void dma_start_transfer(uint8_t epnum, uint8_t dir) {
 
 // Pending operations refer to the current descriptor, never a queued buffer or
 // register snapshot. Cancelled work therefore cannot revive after clear-halt.
+#if CFG_TUD_NRF5X_CONTROL_STALL_QUIET
+static void task_quiet_delay(void);
+#else
+  #define task_quiet_delay() ((void)0)
+#endif
+
 static void dma_dispatch(void) {
   for (;;) {
     // Power removal can preempt USBD. Snapshot and commit one operation with
@@ -271,6 +284,9 @@ static void dma_dispatch(void) {
       }
     }
     __set_PRIMASK(saved);
+    if (operation == DMA_EP0_STATUS) {
+      task_quiet_delay();
+    }
   }
 }
 
@@ -304,20 +320,38 @@ static void xact_in_dma(uint8_t epnum) {
   dma_request(DMA_IN_BASE + epnum + (CFG_TUD_NRF5X_ISO && epnum == EP_ISO_NUM));
 }
 
-// Called with USBD IRQ masked. A retired buffer must be out of hardware's hands
-// before its descriptor can be reused. Its END is acknowledged without a stale
-// completion, while another endpoint's DMA and pending work remain owned.
+// Called with USBD IRQ masked. Observe all EasyDMA before accessing USBD
+// registers, but retire only selected owners. A sibling's raw END, completion
+// accounting, and pending work remain owned by its normal ISR path.
 static bool dma_retire(uint32_t operations) {
   dma_cancel(operations);
+  if (!dma_wait_end(0)) {
+    tusb_hal_nrf_power_event(1);
+    return false;
+  }
   if (operations & _dcd.dma_active) {
-    if (!dma_wait_end(0)) {
-      tusb_hal_nrf_power_event(1);
-      return false;
-    }
     usbd_events(_dcd.dma_active, true);
     edpt_dma_end();
   }
   return true;
+}
+// PRIMASK is either 0 or 1; 2 means no register commit was admitted.
+enum {
+  DMA_COMMIT_FAILED = 2
+};
+// On success the caller restores the returned PRIMASK after MMIO, before a wait.
+static uint32_t dma_commit_begin(uint32_t operations) {
+  const uint8_t generation = _ep0.received;
+  if (!NRF_USBD->ENABLE || !dma_retire(operations)) {
+    return DMA_COMMIT_FAILED;
+  }
+  const uint32_t saved = __get_PRIMASK();
+  __disable_irq();
+  if (NRF_USBD->ENABLE && generation == _ep0.received) {
+    return saved;
+  }
+  __set_PRIMASK(saved);
+  return DMA_COMMIT_FAILED;
 }
 //--------------------------------------------------------------------+
 // Controller API
@@ -347,10 +381,28 @@ static __attribute__((noinline)) bool dcd_int_save(void) {
 }
 
 static __attribute__((noinline)) void dcd_int_restore(bool enabled) {
+  __ISB();
+  __DSB();
   if (enabled && NRF_USBD->ENABLE) {
     dcd_int_enable(0);
   }
 }
+
+#if CFG_TUD_NRF5X_CONTROL_STALL_QUIET
+// Opt in only for a serialized USB task with no endpoint STALL calls from
+// higher-priority IRQs and no caller-held global critical section. The USB task
+// cannot run another class callback until this DCD call/ISR returns.
+// STATUS resumes through fresh dispatcher checks; STALL has finished all TD
+// cleanup and retains its existing USBD IRQ mask until after this delay.
+static void task_quiet_delay(void) {
+  if (__get_PRIMASK()) {
+    // Preserve the caller's mask without introducing a millisecond global wait.
+    tusb_hal_nrf_power_event(1);
+    return;
+  }
+  nrf_delay_us(2000);
+}
+#endif
 
 void dcd_set_address (uint8_t rhport, uint8_t dev_addr)
 {
@@ -648,26 +700,31 @@ void dcd_edpt_stall(uint8_t rhport, uint8_t ep_addr) {
       NRF_USBD->TASKS_EP0STALL = 1;
     }
   } else if (epnum != EP_ISO_NUM) {
-    NRF_USBD->EPSTALL = (USBD_EPSTALL_STALL_Stall << USBD_EPSTALL_STALL_Pos) | ep_addr;
-    if (dir == TUSB_DIR_OUT) {
-      xfer_td_t *xfer     = get_td(epnum, dir);
-      xfer->data_received = OUT_HALTED;
-      if (!dma_retire(TU_BIT(DMA_OUT_BASE + epnum))) {
-        return;
+    // Observe a sibling's END without consuming its completion or ownership.
+    const uint32_t saved = dma_commit_begin(0);
+    if (saved != DMA_COMMIT_FAILED) {
+      NRF_USBD->EPSTALL = (USBD_EPSTALL_STALL_Stall << USBD_EPSTALL_STALL_Pos) | ep_addr;
+      if (dir == TUSB_DIR_OUT) {
+        get_td(epnum, dir)->data_received = OUT_HALTED;
       }
-      xfer->total_len = xfer->actual_len = 0;
+      __set_PRIMASK(saved);
+      if (dir == TUSB_DIR_OUT) {
+        xfer_td_t *xfer = get_td(epnum, dir);
+        if (!dma_retire(TU_BIT(DMA_OUT_BASE + epnum))) {
+          return;
+        }
+        xfer->total_len = xfer->actual_len = 0;
+      }
+      task_quiet_delay();
     }
   }
-  __ISB();
-  __DSB();
   dcd_int_restore(enabled);
 }
-
 void dcd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr) {
   (void)rhport;
   const uint8_t epnum = tu_edpt_number(ep_addr);
   const uint8_t dir   = tu_edpt_dir(ep_addr);
-#if !CFG_TUD_NRF5X_ISO
+  #if !CFG_TUD_NRF5X_ISO
   TU_VERIFY(epnum < EP_CBI_COUNT, );
 #endif
   if (epnum == 0 || epnum == EP_ISO_NUM) {
@@ -677,15 +734,37 @@ void dcd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr) {
   const bool enabled = dcd_int_save();
   NRF_USBD->DTOGGLE = ep_addr;
   NRF_USBD->DTOGGLE = (USBD_DTOGGLE_VALUE_Data0 << USBD_DTOGGLE_VALUE_Pos) | ep_addr;
-  if (dir == TUSB_DIR_OUT) {
+  // Like nrfx_usbd_ep_stall_clear(), discard buffered OUT data only if halted.
+  if (dir == TUSB_DIR_OUT && NRF_USBD->HALTED.EPOUT[epnum]) {
     get_td(epnum, dir)->data_received = 0;
     NRF_USBD->EPDATASTATUS            = TU_BIT(16u + epnum);
     NRF_USBD->SIZE.EPOUT[epnum]       = 0;
   }
   NRF_USBD->EPSTALL = (USBD_EPSTALL_STALL_UnStall << USBD_EPSTALL_STALL_Pos) | ep_addr;
-  __ISB();
-  __DSB();
   dcd_int_restore(enabled);
+}
+
+bool dcd_edpt_abort(uint8_t rhport, uint8_t ep_addr) {
+  (void)rhport;
+  const uint8_t epnum = ep_addr;
+  TU_VERIFY(epnum > 0 && epnum < EP_CBI_COUNT);
+  const bool     enabled = dcd_int_save();
+  const uint32_t saved   = dma_commit_begin(TU_BIT(DMA_OUT_BASE + epnum));
+  const bool     current = saved != DMA_COMMIT_FAILED;
+  if (current) {
+    xfer_td_t *xfer = get_td(epnum, TUSB_DIR_OUT);
+    xfer->total_len = xfer->actual_len = 0;
+    if (xfer->data_received != OUT_HALTED) {
+      xfer->data_received = 0;
+    }
+    // Retire an END not yet serviced by the ISR as well as cached FIFO data.
+    NRF_USBD->EVENTS_ENDEPOUT[epnum] = 0;
+    NRF_USBD->EPDATASTATUS           = TU_BIT(16u + epnum);
+    NRF_USBD->SIZE.EPOUT[epnum]      = 0;
+    __set_PRIMASK(saved);
+  }
+  dcd_int_restore(enabled);
+  return current && NRF_USBD->ENABLE != 0;
 }
 
 /*------------------------------------------------------------------*/
